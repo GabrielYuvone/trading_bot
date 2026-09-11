@@ -273,6 +273,8 @@ def ejecutar_ciclo_bot():
 
 def bot_loop():
   print('🤖 HILO DEL BOT INICIADO EN LA NUBE', flush=True)
+  time.sleep(5)  # Espera a que Flask levante el puerto web
+  print('🤖 HILO DEL BOT INICIADO EN LA NUBE', flush=True)
   for symbol in SIMBOLOS:
     configurar_mercado(symbol)
 
