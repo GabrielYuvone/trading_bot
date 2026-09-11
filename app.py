@@ -10,9 +10,9 @@ import requests
 
 app = Flask(__name__)
 
-# Configuración de Telegram
-TELEGRAM_TOKEN = '8773354278:AAG5ngC7FIa-5v5OTBUuWJq13uXrpw-09IA'
-TELEGRAM_CHAT_ID = '1649971854'
+# Configuración de Telegram (Leyendo desde variables de entorno)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 
 def enviar_telegram(mensaje):
