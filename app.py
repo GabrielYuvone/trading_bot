@@ -6,8 +6,22 @@ from flask import Flask
 import ccxt
 import numpy as np
 import pandas as pd
+import requests
 
 app = Flask(__name__)
+
+# Configuración de Telegram
+TELEGRAM_TOKEN = '8773354278:AAG5ngC7FIa-5v5OTBUuWJq13uXrpw-09IA'
+TELEGRAM_CHAT_ID = '1649971854'
+
+
+def enviar_telegram(mensaje):
+  try:
+    url = f'https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage'
+    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': mensaje}
+    requests.post(url, json=payload, timeout=5)
+  except Exception as e:
+    print(f'⚠️ Error al enviar alerta de Telegram: {e}', flush=True)
 
 
 @app.route('/')
@@ -206,10 +220,12 @@ def ejecutar_ciclo_bot():
           exchange.create_market_order(
               symbol, order_side, amount, params={'reduceOnly': True}
           )
-          print(
-              f'✓ Posición cerrada en {symbol} por cambio de tendencia.',
-              flush=True,
+          msg = (
+              f'🔴 POSICIÓN CERRADA ({symbol})\nTipo: {side.upper()}\nRazón:'
+              ' Cambio de tendencia SuperTrend.'
           )
+          print(msg, flush=True)
+          enviar_telegram(msg)
         except Exception as e:
           print(f'❌ Error al cerrar posición en {symbol}: {e}', flush=True)
       continue
@@ -262,19 +278,20 @@ def ejecutar_ciclo_bot():
               params={'stopPrice': sl_precio, 'triggerPrice': sl_precio},
           )
 
-        print(
-            f'✓ Orden ejecutada para {symbol} [{signal.upper()}] | Tamaño:'
-            f' {amount} contratos | SL en {sl_precio:.4f}',
-            flush=True,
+        msg = (
+            f'🟢 NUEVA OPERACIÓN ({symbol})\nDirección:'
+            f' {signal.upper()}\nTamaño: {amount} contratos\nSL:'
+            f' {sl_precio:.4f}\nADX: {adx_actual:.2f}'
         )
+        print(msg, flush=True)
+        enviar_telegram(msg)
       except Exception as e:
         print(f'❌ Error al abrir posición o SL en {symbol}: {e}', flush=True)
 
 
 def bot_loop():
-  print('🤖 HILO DEL BOT INICIADO EN LA NUBE', flush=True)
-  time.sleep(5)  # Espera a que Flask levante el puerto web
-  print('🤖 HILO DEL BOT INICIADO EN LA NUBE', flush=True)
+  time.sleep(5)  # Espera prudencial para que Flask levante el puerto web
+  print('🤖 HILO DEL BOT INICIADO EN LA NUBE (Con Telegram)', flush=True)
   for symbol in SIMBOLOS:
     configurar_mercado(symbol)
 
@@ -286,7 +303,6 @@ def bot_loop():
     time.sleep(60)
 
 
-# Disparar el hilo del bot al importar o arrancar el módulo en Gunicorn
 def iniciar_bot_background():
   hilo = threading.Thread(target=bot_loop, daemon=True)
   hilo.start()
