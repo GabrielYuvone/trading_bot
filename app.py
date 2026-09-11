@@ -48,9 +48,9 @@ def configurar_mercado(symbol):
   try:
     exchange.load_markets()
     exchange.set_leverage(LEVERAGE, symbol)
-    print(f'✓ Configurado {symbol}: Apalancamiento {LEVERAGE}x')
+    print(f'✓ Configurado {symbol}: Apalancamiento {LEVERAGE}x', flush=True)
   except Exception as e:
-    print(f'⚠️ Aviso en configuración de {symbol}: {e}')
+    print(f'⚠️ Aviso en configuración de {symbol}: {e}', flush=True)
 
 
 def obtener_velas(symbol, limit=250):
@@ -62,7 +62,7 @@ def obtener_velas(symbol, limit=250):
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
     return df
   except Exception as e:
-    print(f'❌ Error al descargar velas para {symbol}: {e}')
+    print(f'❌ Error al descargar velas para {symbol}: {e}', flush=True)
     return None
 
 
@@ -157,14 +157,15 @@ def obtener_posicion_abierta(symbol):
       if p['symbol'] == symbol and float(p['contracts']) > 0:
         return p
   except Exception as e:
-    print(f'⚠️ Error al consultar posición en {symbol}: {e}')
+    print(f'⚠️ Error al consultar posición en {symbol}: {e}', flush=True)
   return None
 
 
 def ejecutar_ciclo_bot():
   print(
       f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔄 Ejecutando ciclo"
-      ' de análisis...'
+      ' de análisis...',
+      flush=True,
   )
 
   for symbol in SIMBOLOS:
@@ -174,7 +175,7 @@ def ejecutar_ciclo_bot():
 
     df = calcular_indicadores(df_raw)
 
-    fila_actual = df.iloc[-2]  # Vela cerrada anterior
+    fila_actual = df.iloc[-2]
     fila_anterior = df.iloc[-3]
 
     precio_actual = fila_actual['close']
@@ -189,15 +190,22 @@ def ejecutar_ciclo_bot():
       side = posicion['side']
       print(
           f'📌 {symbol}: Posición abierta activa ({side.upper()}). Monitoreando'
-          ' salida...'
+          ' salida...',
+          flush=True,
       )
 
       salir = False
       if side == 'long' and not st_actual:
-        print(f'🚨 Señal de salida LONG en {symbol}: SuperTrend viró a bajista.')
+        print(
+            f'🚨 Señal de salida LONG en {symbol}: SuperTrend viró a bajista.',
+            flush=True,
+        )
         salir = True
       elif side == 'short' and st_actual:
-        print(f'🚨 Señal de salida SHORT en {symbol}: SuperTrend viró a alcista.')
+        print(
+            f'🚨 Señal de salida SHORT en {symbol}: SuperTrend viró a alcista.',
+            flush=True,
+        )
         salir = True
 
       if salir:
@@ -207,9 +215,12 @@ def ejecutar_ciclo_bot():
           exchange.create_market_order(
               symbol, order_side, amount, params={'reduceOnly': True}
           )
-          print(f'✓ Posición cerrada en {symbol} por cambio de tendencia.')
+          print(
+              f'✓ Posición cerrada en {symbol} por cambio de tendencia.',
+              flush=True,
+          )
         except Exception as e:
-          print(f'❌ Error al cerrar posición en {symbol}: {e}')
+          print(f'❌ Error al cerrar posición en {symbol}: {e}', flush=True)
       continue
 
     # Evaluar entrada
@@ -223,7 +234,8 @@ def ejecutar_ciclo_bot():
     if signal:
       print(
           f'🎯 ¡Señal detectada para {symbol} ({signal.upper()})! ADX:'
-          f' {adx_actual:.2f}'
+          f' {adx_actual:.2f}',
+          flush=True,
       )
       try:
         ticker = exchange.fetch_ticker(symbol)
@@ -237,7 +249,7 @@ def ejecutar_ciclo_bot():
         amount = float(exchange.amount_to_precision(symbol, raw_amount))
 
         if amount <= 0:
-          print(f'⚠️ Monto muy chico para operar en {symbol}')
+          print(f'⚠️ Monto muy chico para operar en {symbol}', flush=True)
           continue
 
         if signal == 'long':
@@ -263,14 +275,15 @@ def ejecutar_ciclo_bot():
 
         print(
             f'✓ Orden ejecutada para {symbol} [{signal.upper()}] | Tamaño:'
-            f' {amount} contratos | SL en {sl_precio:.4f}'
+            f' {amount} contratos | SL en {sl_precio:.4f}',
+            flush=True,
         )
       except Exception as e:
-        print(f'❌ Error al abrir posición o SL en {symbol}: {e}')
+        print(f'❌ Error al abrir posición o SL en {symbol}: {e}', flush=True)
 
 
 def bot_loop():
-  print('🤖 HILO DEL BOT INICIADO')
+  print('🤖 HILO DEL BOT INICIADO', flush=True)
   for symbol in SIMBOLOS:
     configurar_mercado(symbol)
 
@@ -278,15 +291,13 @@ def bot_loop():
     try:
       ejecutar_ciclo_bot()
     except Exception as e:
-      print(f'⚠️ Error general en el loop del bot: {e}')
+      print(f'⚠️ Error general en el loop del bot: {e}', flush=True)
     time.sleep(60)
 
 
 if __name__ == '__main__':
-  # Arrancar el bot en segundo plano mediante Threads
   hilo_bot = threading.Thread(target=bot_loop, daemon=True)
   hilo_bot.start()
 
-  # Iniciar servidor web para Render
   port = int(os.environ.get('PORT', 5000))
   app.run(host='0.0.0.0', port=port)
