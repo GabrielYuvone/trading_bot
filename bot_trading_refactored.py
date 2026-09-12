@@ -714,14 +714,16 @@ class TradingBot:
     def analizar_symbol(self, symbol: str) -> bool:
         """Analiza un símbolo individual"""
         try:
-            self.logger.debug(f"📊 {symbol}: Iniciando análisis...")
-            
             # Obtener velas
             df_raw = self.exchange.obtener_velas(symbol)
-            if df_raw is None or len(df_raw) < self.config.velas_minimas:
+            if df_raw is None:
+                self.logger.error(f"❌ {symbol}: No se pudieron obtener velas (API error)")
+                return False
+            
+            if len(df_raw) < self.config.velas_minimas:
                 self.logger.warning(
                     f"⚠️ {symbol}: Datos insuficientes "
-                    f"({len(df_raw) if df_raw is not None else 0}/{self.config.velas_minimas})"
+                    f"({len(df_raw)}/{self.config.velas_minimas} velas)"
                 )
                 return False
             
@@ -771,8 +773,6 @@ class TradingBot:
                 self.logger.warning(f"🎯 NUEVA SEÑAL: {signal}")
                 print(f"🎯🎯🎯 NUEVA SEÑAL 🎯🎯🎯\n")
                 self.executor.abrir_posicion(signal, valores)
-            else:
-                self.logger.debug(f"  → {symbol}: Sin señales (monitoreo)")
             
             return True
             
@@ -805,30 +805,45 @@ class TradingBot:
         
         # Separator visual para cada ciclo
         print("\n" + "=" * 100)
-        self.logger.info(f"[CICLO #{self.ciclo_contador}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Analizando {len(self.config.simbolos)} símbolos")
+        self.logger.info(
+            f"[CICLO #{self.ciclo_contador:04d}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+            f"| Analizando {len(self.config.simbolos)} símbolos"
+        )
         print("=" * 100)
         
         exitos = 0
-        errores = 0
+        fallos = []
         
         for symbol in self.config.simbolos:
             try:
-                if self.analizar_symbol(symbol):
-                    exitos += 1
+                if not self.analizar_symbol(symbol):
+                    fallos.append(symbol)
                 else:
-                    errores += 1
+                    exitos += 1
             except Exception as e:
                 self.logger.error(f"❌ Excepción en análisis de {symbol}: {e}")
-                errores += 1
+                self.logger.debug(traceback.format_exc())
+                fallos.append(symbol)
         
         # Resumen del ciclo
         print("-" * 100)
-        self.logger.info(
-            f"✅ Ciclo #{self.ciclo_contador} completado | "
-            f"Exitosos: {exitos}/{len(self.config.simbolos)} | "
-            f"Errores: {errores} | "
-            f"Próximo ciclo en {self.config.ciclo_segundos}s"
-        )
+        
+        if exitos == len(self.config.simbolos):
+            # Todos exitosos
+            self.logger.info(
+                f"✅ CICLO #{self.ciclo_contador:04d} COMPLETADO | "
+                f"Todos los símbolos analizados: {exitos}/{len(self.config.simbolos)} ✅ | "
+                f"Próximo ciclo en {self.config.ciclo_segundos}s"
+            )
+        else:
+            # Algunos fallaron
+            self.logger.warning(
+                f"⚠️ CICLO #{self.ciclo_contador:04d} COMPLETADO | "
+                f"Exitosos: {exitos}/{len(self.config.simbolos)} | "
+                f"Fallos: {', '.join(fallos)} | "
+                f"Próximo ciclo en {self.config.ciclo_segundos}s"
+            )
+        
         print("-" * 100)
     
     def ejecutar(self):
@@ -871,25 +886,61 @@ bot = None
 
 @app.route('/')
 def home():
-    return (
-        f'🤖 Bot de Trading OKX Testnet en ejecución (Ciclo {bot.ciclo_contador})<br>'
-        f'Símbolos: {", ".join(config.simbolos)}<br>'
-        f'Logs: ver bot_trading.log'
-    )
+    """Endpoint principal - muestra estado del bot"""
+    global bot
+    
+    if bot is None:
+        return (
+            '⏳ <b>Bot de Trading OKX Testnet - Inicializando...</b><br>'
+            'El bot está en proceso de inicio. Intenta de nuevo en 10 segundos.<br><br>'
+            f'Símbolos: {", ".join(config.simbolos)}<br>'
+            'Logs: ver bot_trading.log'
+        ), 202  # 202 Accepted (en proceso)
+    
+    try:
+        ciclo = getattr(bot, 'ciclo_contador', 0)
+        estado = '✅ ACTIVO' if bot.activo else '⏸️ INACTIVO'
+        
+        return (
+            f'🤖 <b>Bot de Trading OKX Testnet {estado}</b><br>'
+            f'Ciclos ejecutados: {ciclo}<br>'
+            f'Símbolos: {", ".join(config.simbolos)}<br>'
+            f'Logs: <a href="/logs">Ver logs en tiempo real</a>'
+        )
+    except Exception as e:
+        return (
+            f'❌ Error obteniendo estado: {str(e)}<br>'
+            'Revisa el archivo bot_trading.log'
+        ), 500
 
 
 @app.route('/status')
 def status():
-    """Endpoint para verificar estado del bot"""
-    if not bot:
-        return {'estado': 'no_inicializado'}, 503
+    """Endpoint para verificar estado del bot (JSON)"""
+    global bot
     
-    return {
-        'estado': 'activo' if bot.activo else 'inactivo',
-        'ciclos_ejecutados': bot.ciclo_contador,
-        'simbolos': config.simbolos,
-        'timestamp': datetime.now().isoformat()
-    }
+    if bot is None:
+        return {
+            'estado': 'inicializando',
+            'mensaje': 'El bot está en proceso de inicio',
+            'ciclos_ejecutados': 0,
+            'simbolos': config.simbolos,
+            'timestamp': datetime.now().isoformat()
+        }, 202  # 202 Accepted (en proceso)
+    
+    try:
+        return {
+            'estado': 'activo' if bot.activo else 'inactivo',
+            'ciclos_ejecutados': bot.ciclo_contador,
+            'simbolos': config.simbolos,
+            'timestamp': datetime.now().isoformat()
+        }, 200
+    except Exception as e:
+        return {
+            'estado': 'error',
+            'error': str(e),
+            'timestamp': datetime.now().isoformat()
+        }, 500
 
 
 def iniciar_bot_background():
