@@ -681,9 +681,10 @@ class TradingBot:
     def inicializar(self) -> bool:
         """Inicializa el bot"""
         try:
-            print("\n" + "=" * 100)
+            self.logger.info("")
+            self.logger.info("=" * 100)
             self.logger.info("🤖🤖🤖 INICIANDO BOT DE TRADING OKX 🤖🤖🤖")
-            print("=" * 100)
+            self.logger.info("=" * 100)
             
             self.logger.info(f"📊 Símbolos: {', '.join(self.config.simbolos)}")
             self.logger.info(f"⏰ Timeframe: {self.config.timeframe}")
@@ -693,14 +694,16 @@ class TradingBot:
             self.logger.info(f"⏳ Ciclo: cada {self.config.ciclo_segundos} segundos")
             
             # Configurar mercados
-            self.logger.info("\n🔧 Configurando mercados...")
+            self.logger.info("")
+            self.logger.info("🔧 Configurando mercados...")
             for symbol in self.config.simbolos:
                 if not self.exchange.configurar_mercado(symbol):
                     self.logger.warning(f"⚠️ No se pudo configurar {symbol}")
             
-            print("=" * 100)
+            self.logger.info("=" * 100)
             self.logger.info("✅ Bot inicializado correctamente y listo para operar")
-            print("=" * 100 + "\n")
+            self.logger.info("=" * 100)
+            self.logger.info("")
             
             notifier.enviar("🤖 Bot de trading OKX iniciado y funcionando", "SUCCESS")
             return True
@@ -769,9 +772,11 @@ class TradingBot:
                     adx=valores.adx,
                     timestamp=datetime.now()
                 )
-                print(f"\n🎯🎯🎯 SEÑAL DETECTADA 🎯🎯🎯")
+                self.logger.warning("")
+                self.logger.warning("🎯🎯🎯 SEÑAL DETECTADA 🎯🎯🎯")
                 self.logger.warning(f"🎯 NUEVA SEÑAL: {signal}")
-                print(f"🎯🎯🎯 NUEVA SEÑAL 🎯🎯🎯\n")
+                self.logger.warning("🎯🎯🎯 NUEVA SEÑAL 🎯🎯🎯")
+                self.logger.warning("")
                 self.executor.abrir_posicion(signal, valores)
             
             return True
@@ -803,13 +808,13 @@ class TradingBot:
         """Ciclo principal de análisis"""
         self.ciclo_contador += 1
         
-        # Separator visual para cada ciclo
-        print("\n" + "=" * 100)
+        self.logger.info("")  # Línea en blanco
+        self.logger.info("=" * 100)
         self.logger.info(
             f"[CICLO #{self.ciclo_contador:04d}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
             f"| Analizando {len(self.config.simbolos)} símbolos"
         )
-        print("=" * 100)
+        self.logger.info("=" * 100)
         
         exitos = 0
         fallos = []
@@ -826,13 +831,13 @@ class TradingBot:
                 fallos.append(symbol)
         
         # Resumen del ciclo
-        print("-" * 100)
+        self.logger.info("-" * 100)
         
         if exitos == len(self.config.simbolos):
             # Todos exitosos
             self.logger.info(
                 f"✅ CICLO #{self.ciclo_contador:04d} COMPLETADO | "
-                f"Todos los símbolos analizados: {exitos}/{len(self.config.simbolos)} ✅ | "
+                f"Todos: {exitos}/{len(self.config.simbolos)} ✅ | "
                 f"Próximo ciclo en {self.config.ciclo_segundos}s"
             )
         else:
@@ -844,7 +849,7 @@ class TradingBot:
                 f"Próximo ciclo en {self.config.ciclo_segundos}s"
             )
         
-        print("-" * 100)
+        self.logger.info("-" * 100)
     
     def ejecutar(self):
         """Bucle principal del bot"""
@@ -947,10 +952,7 @@ def iniciar_bot_background():
     """Inicia el bot en un hilo de fondo"""
     global bot
     
-    print("\n" + "🚀" * 50)
     logger.info("⏳ Hilo de fondo del bot iniciado, esperando a Flask (5 segundos)...")
-    print("🚀" * 50 + "\n")
-    
     time.sleep(5)  # Espera a que Flask se levante
     
     try:
