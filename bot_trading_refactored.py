@@ -3,7 +3,7 @@ Bot de Trading OKX Testnet - Versión Refactorizada
 Estrategia: SuperTrend + EMA200 + ADX
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 import os
 import threading
 import time
@@ -19,6 +19,17 @@ import ccxt
 import numpy as np
 import pandas as pd
 import requests
+
+# Zona horaria del usuario: Argentina (GMT-3)
+GMT_MINUS_3 = timezone(timedelta(hours=-3))
+
+# Horarios de reporte a Telegram (en hora local Argentina):
+# Día (07-22): cada 1 hora
+# Noche (23-06): cada 2 horas
+REPORTES_HORAS = (
+    7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,  # día
+    23, 1, 3, 5,                                                    # noche
+)
 
 # ============================================================================
 # CONFIGURACIÓN DE LOGGING
@@ -697,6 +708,12 @@ class TradingBot:
 
         self.activo = True
         self.ciclo_contador = 0
+
+        # === Estado para reportes Telegram horarios ===
+        # Último envío de reporte (para no repetir en la misma hora)
+        self.ultimo_reporte_ts = None
+        # Estado actual de cada símbolo: {symbol: {precio, st, adx, posicion, razon}}
+        self.estado_simbolos = {}
     
     def inicializar(self) -> bool:
         """Inicializa el bot"""
@@ -783,6 +800,20 @@ class TradingBot:
 
             # Verificar posición existente
             posicion = self.exchange.obtener_posicion_abierta(symbol)
+            tiene_posicion = posicion is not None
+
+            # Determinar razón de no operar (para reporte Telegram horario)
+            razon_no_operar = self._determinar_razon_no_operar(valores, tiene_posicion)
+
+            # Registrar estado actual para el reporte horario
+            self.estado_simbolos[symbol] = {
+                'precio': precio_live,
+                'st': st_live,
+                'adx': valores.adx,
+                'posicion': tiene_posicion,
+                'side_posicion': posicion['side'] if tiene_posicion else None,
+                'razon': razon_no_operar,
+            }
 
             if posicion:
                 self.bot_logger.info(
@@ -834,7 +865,103 @@ class TradingBot:
         if debe_cerrar:
             self.bot_logger.warning(f"🚨 Señal de SALIDA en {symbol}: {razon}")
             self.executor.cerrar_posicion(symbol, posicion, razon)
-    
+
+    # ============================================================================
+    # REPORTE TELEGRAM HORARIO
+    # ============================================================================
+
+    def _determinar_razon_no_operar(self, valores: IndicatorValues,
+                                     posicion_abierta: bool) -> str:
+        """Determina por qué el bot NO abrió posición nueva en este símbolo.
+
+        Sigue el mismo orden lógico que `TechnicalAnalyzer.detectar_señal()`:
+        si la señal fue NEUTRAL, alguna de estas condiciones falló.
+        """
+        if posicion_abierta:
+            return "pos. abierta"
+        if valores.adx < self.config.adx_threshold:
+            return f"ADX débil ({valores.adx:.0f})"
+        if valores.st_direction == valores.st_direction_anterior:
+            return "ST sin cambio"
+        # ST cambió pero el precio no confirmó del lado correcto de la EMA200
+        if valores.st_direction and valores.precio_actual <= valores.ema200:
+            return "precio < EMA200"
+        if not valores.st_direction and valores.precio_actual >= valores.ema200:
+            return "precio > EMA200"
+        return "sin señal"
+
+    def _debe_enviar_reporte(self) -> bool:
+        """Verifica si en este ciclo toca enviar reporte a Telegram.
+
+        Horario Argentina (GMT-3):
+        - Día (07-22): cada 1 hora
+        - Noche (23, 01, 03, 05): cada 2 horas
+        """
+        ahora = datetime.now(GMT_MINUS_3)
+
+        # ¿Ya enviamos reporte en esta misma hora-calendario?
+        if (self.ultimo_reporte_ts is not None and
+            self.ultimo_reporte_ts.hour == ahora.hour and
+            self.ultimo_reporte_ts.date() == ahora.date()):
+            return False
+
+        if ahora.hour in REPORTES_HORAS:
+            self.ultimo_reporte_ts = ahora
+            return True
+        return False
+
+    def _generar_reporte_telegram(self) -> str:
+        """Genera un mensaje conciso con el estado actual del bot."""
+        ahora = datetime.now(GMT_MINUS_3)
+        hora_str = ahora.strftime('%H:%M')
+
+        lineas = [f"📊 {hora_str} AR | C#{self.ciclo_contador:04d}", ""]
+
+        razones_no_operar = []
+        posiciones_abiertas = []
+
+        for symbol in self.config.simbolos:
+            estado = self.estado_simbolos.get(symbol, {})
+            if not estado:
+                continue
+
+            sym_corto = symbol.split('/')[0]  # BTC, ETH, SOL
+            precio = estado.get('precio', 0)
+            st = estado.get('st', False)
+            adx = estado.get('adx', 0)
+            flecha = "↗️" if st else "↘️"
+
+            if estado.get('posicion'):
+                side = estado.get('side_posicion', '').upper()
+                lineas.append(f"• {sym_corto} ${precio:.0f} {flecha} ADX{adx:.0f} 📍POS {side}")
+                posiciones_abiertas.append(f"{sym_corto} {side}")
+            else:
+                lineas.append(f"• {sym_corto} ${precio:.0f} {flecha} ADX{adx:.0f}")
+                razon = estado.get('razon')
+                if razon:
+                    razones_no_operar.append(f"{sym_corto}: {razon}")
+
+        # Resumen final: ¿por qué no operó?
+        if not posiciones_abiertas and razones_no_operar:
+            lineas.append("")
+            lineas.append(f"❌ No operé: {'; '.join(razones_no_operar)}")
+        elif razones_no_operar:
+            lineas.append("")
+            lineas.append(f"❌ Sin señales nuevas: {'; '.join(razones_no_operar)}")
+
+        return "\n".join(lineas)
+
+    def _enviar_reporte_telegram(self):
+        """Genera y envía el reporte horario a Telegram."""
+        try:
+            reporte = self._generar_reporte_telegram()
+            notifier.enviar(reporte, "INFO")
+            self.logger.info(
+                f"📤 Reporte Telegram horario enviado ({len(reporte)} chars)"
+            )
+        except Exception as e:
+            self.logger.warning(f"⚠️ Error enviando reporte Telegram: {e}")
+
     def ciclo_analisis(self):
         """Ciclo principal de análisis"""
         self.ciclo_contador += 1
@@ -879,8 +1006,12 @@ class TradingBot:
                 f"Fallos: {', '.join(fallos)} | "
                 f"Próximo ciclo en {self.config.ciclo_segundos}s"
             )
-        
+
         self.logger.info("-" * 100)
+
+        # === Reporte horario a Telegram (día cada 1h, noche cada 2h, horario AR) ===
+        if self._debe_enviar_reporte():
+            self._enviar_reporte_telegram()
     
     def ejecutar(self):
         """Bucle principal del bot"""
