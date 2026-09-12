@@ -840,8 +840,8 @@ bot = None
 
 @app.route('/')
 def home():
-    return (
-        f'🤖 Bot de Trading OKX Testnet en ejecución (Ciclo {bot.ciclo_contador})<br>'
+    ciclo = getattr(bot, 'ciclo_contador', 0) if 'bot' in globals() and bot is not None else 0
+    return f'🤖 Bot de Trading OKX Testnet en ejecución (Ciclo {ciclo})<br>'
         f'Símbolos: {", ".join(config.simbolos)}<br>'
         f'Logs: ver bot_trading.log'
     )
