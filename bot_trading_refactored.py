@@ -948,30 +948,34 @@ def status():
         }, 500
 
 
-def iniciar_bot_background():
-    """Inicia el bot en un hilo de fondo"""
-    global bot
-    
-    logger.info("⏳ Hilo de fondo del bot iniciado, esperando a Flask (5 segundos)...")
-    time.sleep(5)  # Espera a que Flask se levante
-    
-    try:
-        logger.info("🔄 Intentando instanciar TradingBot...")
-        bot = TradingBot(config)
-        logger.info("✅ TradingBot instanciado con éxito. Ejecutando ciclos...")
-        bot.ejecutar()
-    except Exception as e:
-        logger.critical(f"❌ Error fatal en bot: {e}")
-        logger.debug(traceback.format_exc())
-        notifier.enviar(f"Error fatal en bot: {e}", "ERROR")
+
 
 
 if __name__ == '__main__':
-    # Iniciar bot en hilo de fondo
-    hilo = threading.Thread(target=iniciar_bot_background, daemon=True)
-    hilo.start()
+    global bot
     
-    # Iniciar Flask
-    port = int(os.environ.get('PORT', 5000))
-    logger.info(f"🌐 Iniciando Flask en puerto {port}...")
-    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
+    try:
+        # Iniciar Flask en hilo de fondo (es daemon)
+        port = int(os.environ.get('PORT', 5000))
+        logger.info(f"🌐 Iniciando Flask en puerto {port}...")
+        
+        flask_thread = threading.Thread(
+            target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False),
+            daemon=True
+        )
+        flask_thread.start()
+        
+        # Esperar a que Flask se levante
+        logger.info("⏳ Esperando a que Flask se levante (5 segundos)...")
+        time.sleep(5)
+        
+        # Iniciar el bot en el thread principal (bloqueante)
+        logger.info("🔄 Intentando instanciar TradingBot...")
+        bot = TradingBot(config)
+        logger.info("✅ TradingBot instanciado con éxito. Ejecutando ciclos...")
+        bot.ejecutar()  # Esto es bloqueante, el bot corre aquí
+        
+    except Exception as e:
+        logger.critical(f"❌ Error fatal: {e}")
+        logger.debug(traceback.format_exc())
+        notifier.enviar(f"Error fatal: {e}", "ERROR")
