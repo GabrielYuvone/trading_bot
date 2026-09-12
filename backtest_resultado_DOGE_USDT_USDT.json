@@ -1,0 +1,16 @@
+{
+    "simbolo": "DOGE/USDT:USDT",
+    "periodo_dias": 180,
+    "capital_inicial": 1000.0,
+    "capital_final": 993.8,
+    "pnl_total": -6.2,
+    "retorno_pct": -0.62,
+    "total_trades": 39,
+    "trades_ganadores": 7,
+    "win_rate": 17.95,
+    "ganancia_promedio": 0.6,
+    "perdida_promedio": 0.33,
+    "ratio_gp": 1.85,
+    "max_drawdown": -0.77,
+    "factor_recuperacion": 0.81
+}

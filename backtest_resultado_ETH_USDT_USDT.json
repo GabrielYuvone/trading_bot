@@ -1,0 +1,16 @@
+{
+    "simbolo": "ETH/USDT:USDT",
+    "periodo_dias": 180,
+    "capital_inicial": 1000.0,
+    "capital_final": 1766.14,
+    "pnl_total": 766.14,
+    "retorno_pct": 76.61,
+    "total_trades": 31,
+    "trades_ganadores": 7,
+    "win_rate": 22.58,
+    "ganancia_promedio": 230.51,
+    "perdida_promedio": 35.31,
+    "ratio_gp": 6.53,
+    "max_drawdown": -25.34,
+    "factor_recuperacion": 1.64
+}

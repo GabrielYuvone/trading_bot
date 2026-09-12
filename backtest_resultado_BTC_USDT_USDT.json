@@ -1,0 +1,16 @@
+{
+    "simbolo": "BTC/USDT:USDT",
+    "periodo_dias": 180,
+    "capital_inicial": 1000.0,
+    "capital_final": 1114.09,
+    "pnl_total": 114.09,
+    "retorno_pct": 11.41,
+    "total_trades": 35,
+    "trades_ganadores": 15,
+    "win_rate": 42.86,
+    "ganancia_promedio": 48.77,
+    "perdida_promedio": 30.87,
+    "ratio_gp": 1.58,
+    "max_drawdown": -15.66,
+    "factor_recuperacion": 0.55
+}

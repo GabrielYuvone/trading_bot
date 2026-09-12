@@ -1,0 +1,16 @@
+{
+    "simbolo": "SOL/USDT:USDT",
+    "periodo_dias": 180,
+    "capital_inicial": 1000.0,
+    "capital_final": 2305.09,
+    "pnl_total": 1305.09,
+    "retorno_pct": 130.51,
+    "total_trades": 32,
+    "trades_ganadores": 14,
+    "win_rate": 43.75,
+    "ganancia_promedio": 136.24,
+    "perdida_promedio": 33.46,
+    "ratio_gp": 4.07,
+    "max_drawdown": -13.18,
+    "factor_recuperacion": 4.28
+}

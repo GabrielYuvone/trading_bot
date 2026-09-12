@@ -1,0 +1,9 @@
+Use this token to access the HTTP API:
+8773354278:AAG5ngC7FIa-5v5OTBUuWJq13uXrpw-09IA
+Keep your token secure and store it safely, it can be used by anyone to control your bot.
+
+Id: 1649971854
+First: Gabriel
+Last: Yuvone
+Lang: es
+Registered: Check Date

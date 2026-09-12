@@ -1,0 +1,16 @@
+{
+    "simbolo": "XRP/USDT:USDT",
+    "periodo_dias": 180,
+    "capital_inicial": 1000.0,
+    "capital_final": 995.42,
+    "pnl_total": -4.58,
+    "retorno_pct": -0.46,
+    "total_trades": 34,
+    "trades_ganadores": 7,
+    "win_rate": 20.59,
+    "ganancia_promedio": 0.6,
+    "perdida_promedio": 0.33,
+    "ratio_gp": 1.85,
+    "max_drawdown": -0.52,
+    "factor_recuperacion": 0.88
+}
