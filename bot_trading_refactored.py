@@ -865,10 +865,13 @@ def iniciar_bot_background():
     """Inicia el bot en un hilo de fondo"""
     global bot
     
+    logger.info("⏳ Hilo de fondo iniciado, esperando 5 segundos...")
     time.sleep(5)  # Espera a que Flask se levante
     
     try:
+        logger.info("🔄 Intentando instanciar TradingBot...")
         bot = TradingBot(config)
+        logger.info("✅ TradingBot instanciado con éxito. Ejecutando...")
         bot.ejecutar()
     except Exception as e:
         logger.critical(f"❌ Error fatal en bot: {e}")
