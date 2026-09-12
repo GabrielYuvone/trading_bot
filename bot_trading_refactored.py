@@ -1,7 +1,6 @@
 """
 Bot de Trading OKX Testnet - Versión Refactorizada
 Estrategia: SuperTrend + EMA200 + ADX
-MEJORADO EN LOGS POR Z
 """
 
 from datetime import datetime
@@ -87,8 +86,11 @@ def setup_logging(log_file: str = 'bot_trading.log') -> logging.Logger:
         ))
         root.addHandler(file_handler)
 
-    # Silenciar logs ruidosos de librerías externas
-    for noisy in ('flask', 'werkzeug', 'urllib3'):
+    # Silenciar logs ruidosos de librerías externas.
+    # ccxt emite DEBUG con el request/response HTTP completo (incluye API key,
+    # passphrase y signature en texto plano) — subimos a WARNING por seguridad
+    # y para no contaminar la consola.
+    for noisy in ('flask', 'werkzeug', 'urllib3', 'ccxt', 'requests'):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # Devolver el logger 'TradingBot' para uso en el bloque __main__
@@ -755,24 +757,35 @@ class TradingBot:
             if not valores:
                 self.logger.error(f"❌ {symbol}: No se pudieron extraer indicadores")
                 return False
-            
-            # Log de estado detallado
-            tendencia = "ALCISTA ↗️" if valores.st_direction else "BAJISTA ↘️"
-            precio_dist_ema = ((valores.precio_actual - valores.ema200) / valores.ema200) * 100
-            
-            self.logger.info(
+
+            # === Log de estado detallado ===
+            # Para el LOG mostramos la vela EN FORMACIÓN (df.iloc[-1]) que
+            # actualiza su close en tiempo real con cada trade — así el
+            # Precio cambia entre ciclos. Las DECISIONES de trading
+            # (`valores` = df.iloc[-2], última vela cerrada) quedan intactas:
+            # operar sobre velas cerradas evita repintado y falsas señales.
+            fila_live = df.iloc[-1]
+            precio_live = float(fila_live['close'])
+            ema200_live = float(fila_live['ema200'])
+            adx_live = float(fila_live['adx'])
+            st_live = bool(fila_live['st_direction'])
+
+            tendencia = "ALCISTA ↗️" if st_live else "BAJISTA ↘️"
+            precio_dist_ema = ((precio_live - ema200_live) / ema200_live) * 100
+
+            self.bot_logger.info(
                 f"📈 {symbol:15} | "
-                f"Precio: ${valores.precio_actual:12.4f} | "
-                f"EMA200: ${valores.ema200:12.4f} ({precio_dist_ema:+7.2f}%) | "
-                f"ADX: {valores.adx:6.2f} | "
+                f"Precio: ${precio_live:8.2f} | "
+                f"EMA200: ${ema200_live:8.2f} ({precio_dist_ema:+6.2f}%) | "
+                f"ADX: {adx_live:5.2f} | "
                 f"ST: {tendencia}"
             )
-            
+
             # Verificar posición existente
             posicion = self.exchange.obtener_posicion_abierta(symbol)
-            
+
             if posicion:
-                self.logger.info(
+                self.bot_logger.info(
                     f"📌 {symbol}: POSICIÓN ABIERTA ({posicion['side'].upper()}) - "
                     f"{float(posicion['contracts'])} contratos"
                 )
@@ -819,7 +832,7 @@ class TradingBot:
             razon = "SuperTrend cambió a alcista"
         
         if debe_cerrar:
-            self.logger.warning(f"🚨 Señal de SALIDA en {symbol}: {razon}")
+            self.bot_logger.warning(f"🚨 Señal de SALIDA en {symbol}: {razon}")
             self.executor.cerrar_posicion(symbol, posicion, razon)
     
     def ciclo_analisis(self):
