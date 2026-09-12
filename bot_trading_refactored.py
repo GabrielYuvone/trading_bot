@@ -952,8 +952,6 @@ def status():
 
 
 if __name__ == '__main__':
-    global bot
-    
     try:
         # Iniciar Flask en hilo de fondo (es daemon)
         port = int(os.environ.get('PORT', 5000))
