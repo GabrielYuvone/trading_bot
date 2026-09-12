@@ -46,6 +46,10 @@ def setup_logging(name: str, log_file: str = None) -> logging.Logger:
     """Configura logging con salida a consola y archivo opcional"""
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
+    logger.propagate = False  # No propagar a root logger
+    
+    # Limpiar handlers existentes
+    logger.handlers.clear()
     
     # Handler para consola
     console_handler = logging.StreamHandler()
@@ -71,7 +75,13 @@ def setup_logging(name: str, log_file: str = None) -> logging.Logger:
     return logger
 
 
+# Configurar logging principal
 logger = setup_logging('TradingBot', 'bot_trading.log')
+
+# Silenciar logs de Flask y Werkzeug
+logging.getLogger('flask').setLevel(logging.WARNING)
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 
 # ============================================================================
@@ -284,7 +294,6 @@ class ExchangeManager:
         limit = limit or self.config.limite_velas
         
         try:
-            self.logger.debug(f"Obteniendo {limit} velas para {symbol}...")
             ohlcv = self.exchange.fetch_ohlcv(symbol, self.config.timeframe, limit=limit)
             
             df = pd.DataFrame(
@@ -293,7 +302,6 @@ class ExchangeManager:
             )
             df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
             
-            self.logger.debug(f"✓ {symbol}: {len(df)} velas obtenidas")
             return df
             
         except ccxt.BadSymbol:
@@ -310,16 +318,12 @@ class ExchangeManager:
         """Obtiene posición abierta si existe"""
         try:
             positions = self.exchange.fetch_positions([symbol])
-            self.logger.debug(f"{symbol}: Consultando {len(positions)} posición(es)")
             
             for p in positions:
                 contracts = float(p.get('contracts', 0))
                 if contracts > 0:
-                    side = p['side']
-                    self.logger.debug(f"  ✓ Posición activa: {side.upper()} {contracts} contratos")
                     return p
             
-            self.logger.debug(f"{symbol}: Sin posiciones abiertas")
             return None
             
         except ccxt.NetworkError:
@@ -400,8 +404,6 @@ class TechnicalAnalyzer:
     def calcular_indicadores(self, df: pd.DataFrame) -> pd.DataFrame:
         """Calcula todos los indicadores técnicos"""
         try:
-            self.logger.debug("Calculando indicadores...")
-            
             high = df['high']
             low = df['low']
             close = df['close']
@@ -475,7 +477,6 @@ class TechnicalAnalyzer:
             df['st_direction'] = st
             df['ema200'] = close.ewm(span=self.config.periodo_ema, adjust=False).mean()
 
-            self.logger.debug("✓ Indicadores calculados")
             return df
             
         except Exception as e:
@@ -680,24 +681,28 @@ class TradingBot:
     def inicializar(self) -> bool:
         """Inicializa el bot"""
         try:
-            self.logger.info("=" * 80)
-            self.logger.info("🤖 INICIANDO BOT DE TRADING OKX")
-            self.logger.info("=" * 80)
+            print("\n" + "=" * 100)
+            self.logger.info("🤖🤖🤖 INICIANDO BOT DE TRADING OKX 🤖🤖🤖")
+            print("=" * 100)
             
-            self.logger.info(f"Símbolos: {', '.join(self.config.simbolos)}")
-            self.logger.info(f"Timeframe: {self.config.timeframe}")
-            self.logger.info(f"Leverage: {self.config.leverage}x")
-            self.logger.info(f"Capital de riesgo: {self.config.capital_riesgo_usdt} USDT")
-            self.logger.info(f"ADX Threshold: {self.config.adx_threshold}")
-            self.logger.info("=" * 80)
+            self.logger.info(f"📊 Símbolos: {', '.join(self.config.simbolos)}")
+            self.logger.info(f"⏰ Timeframe: {self.config.timeframe}")
+            self.logger.info(f"📈 Leverage: {self.config.leverage}x")
+            self.logger.info(f"💰 Capital de riesgo: {self.config.capital_riesgo_usdt} USDT por operación")
+            self.logger.info(f"📊 ADX Threshold: {self.config.adx_threshold}")
+            self.logger.info(f"⏳ Ciclo: cada {self.config.ciclo_segundos} segundos")
             
             # Configurar mercados
+            self.logger.info("\n🔧 Configurando mercados...")
             for symbol in self.config.simbolos:
                 if not self.exchange.configurar_mercado(symbol):
                     self.logger.warning(f"⚠️ No se pudo configurar {symbol}")
             
-            self.logger.info("✓ Bot inicializado correctamente")
-            notifier.enviar("🤖 Bot de trading iniciado", "SUCCESS")
+            print("=" * 100)
+            self.logger.info("✅ Bot inicializado correctamente y listo para operar")
+            print("=" * 100 + "\n")
+            
+            notifier.enviar("🤖 Bot de trading OKX iniciado y funcionando", "SUCCESS")
             return True
             
         except Exception as e:
@@ -709,6 +714,8 @@ class TradingBot:
     def analizar_symbol(self, symbol: str) -> bool:
         """Analiza un símbolo individual"""
         try:
+            self.logger.debug(f"📊 {symbol}: Iniciando análisis...")
+            
             # Obtener velas
             df_raw = self.exchange.obtener_velas(symbol)
             if df_raw is None or len(df_raw) < self.config.velas_minimas:
@@ -723,21 +730,29 @@ class TradingBot:
             valores, _ = self.analyzer.extraer_valores(df)
             
             if not valores:
+                self.logger.error(f"❌ {symbol}: No se pudieron extraer indicadores")
                 return False
             
-            # Log de estado
+            # Log de estado detallado
+            tendencia = "ALCISTA ↗️" if valores.st_direction else "BAJISTA ↘️"
+            precio_dist_ema = ((valores.precio_actual - valores.ema200) / valores.ema200) * 100
+            
             self.logger.info(
-                f"{symbol} | Precio: {valores.precio_actual:.4f} | "
-                f"EMA200: {valores.ema200:.4f} | "
-                f"ADX: {valores.adx:.2f} | "
-                f"ST: {'↗️' if valores.st_direction else '↘️'}"
+                f"📈 {symbol:15} | "
+                f"Precio: ${valores.precio_actual:12.4f} | "
+                f"EMA200: ${valores.ema200:12.4f} ({precio_dist_ema:+7.2f}%) | "
+                f"ADX: {valores.adx:6.2f} | "
+                f"ST: {tendencia}"
             )
             
             # Verificar posición existente
             posicion = self.exchange.obtener_posicion_abierta(symbol)
             
             if posicion:
-                self.logger.info(f"📌 {symbol}: Posición abierta ({posicion['side'].upper()})")
+                self.logger.info(
+                    f"📌 {symbol}: POSICIÓN ABIERTA ({posicion['side'].upper()}) - "
+                    f"{float(posicion['contracts'])} contratos"
+                )
                 self._manejar_posicion_abierta(symbol, posicion, valores)
                 return True
             
@@ -752,8 +767,12 @@ class TradingBot:
                     adx=valores.adx,
                     timestamp=datetime.now()
                 )
-                self.logger.warning(f"🎯 SEÑAL DETECTADA: {signal}")
+                print(f"\n🎯🎯🎯 SEÑAL DETECTADA 🎯🎯🎯")
+                self.logger.warning(f"🎯 NUEVA SEÑAL: {signal}")
+                print(f"🎯🎯🎯 NUEVA SEÑAL 🎯🎯🎯\n")
                 self.executor.abrir_posicion(signal, valores)
+            else:
+                self.logger.debug(f"  → {symbol}: Sin señales (monitoreo)")
             
             return True
             
@@ -784,21 +803,33 @@ class TradingBot:
         """Ciclo principal de análisis"""
         self.ciclo_contador += 1
         
-        self.logger.info(
-            f"\n{'=' * 80}\n"
-            f"[CICLO {self.ciclo_contador}] "
-            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-            f"{'=' * 80}"
-        )
+        # Separator visual para cada ciclo
+        print("\n" + "=" * 100)
+        self.logger.info(f"[CICLO #{self.ciclo_contador}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} | Analizando {len(self.config.simbolos)} símbolos")
+        print("=" * 100)
         
         exitos = 0
-        for symbol in self.config.simbolos:
-            if self.analizar_symbol(symbol):
-                exitos += 1
+        errores = 0
         
+        for symbol in self.config.simbolos:
+            try:
+                if self.analizar_symbol(symbol):
+                    exitos += 1
+                else:
+                    errores += 1
+            except Exception as e:
+                self.logger.error(f"❌ Excepción en análisis de {symbol}: {e}")
+                errores += 1
+        
+        # Resumen del ciclo
+        print("-" * 100)
         self.logger.info(
-            f"✓ Ciclo completado: {exitos}/{len(self.config.simbolos)} análisis exitosos"
+            f"✅ Ciclo #{self.ciclo_contador} completado | "
+            f"Exitosos: {exitos}/{len(self.config.simbolos)} | "
+            f"Errores: {errores} | "
+            f"Próximo ciclo en {self.config.ciclo_segundos}s"
         )
+        print("-" * 100)
     
     def ejecutar(self):
         """Bucle principal del bot"""
@@ -840,8 +871,8 @@ bot = None
 
 @app.route('/')
 def home():
-    ciclo = getattr(bot, 'ciclo_contador', 0) if 'bot' in globals() and bot is not None else 0
-    return (f'🤖 Bot de Trading OKX Testnet en ejecución (Ciclo {ciclo})<br>'
+    return (
+        f'🤖 Bot de Trading OKX Testnet en ejecución (Ciclo {bot.ciclo_contador})<br>'
         f'Símbolos: {", ".join(config.simbolos)}<br>'
         f'Logs: ver bot_trading.log'
     )
@@ -865,13 +896,16 @@ def iniciar_bot_background():
     """Inicia el bot en un hilo de fondo"""
     global bot
     
-    logger.info("⏳ Hilo de fondo iniciado, esperando 5 segundos...")
+    print("\n" + "🚀" * 50)
+    logger.info("⏳ Hilo de fondo del bot iniciado, esperando a Flask (5 segundos)...")
+    print("🚀" * 50 + "\n")
+    
     time.sleep(5)  # Espera a que Flask se levante
     
     try:
         logger.info("🔄 Intentando instanciar TradingBot...")
         bot = TradingBot(config)
-        logger.info("✅ TradingBot instanciado con éxito. Ejecutando...")
+        logger.info("✅ TradingBot instanciado con éxito. Ejecutando ciclos...")
         bot.ejecutar()
     except Exception as e:
         logger.critical(f"❌ Error fatal en bot: {e}")
