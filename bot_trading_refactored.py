@@ -25,8 +25,13 @@ import requests
 # ============================================================================
 
 class ColoredFormatter(logging.Formatter):
-    """Formatter con colores para mejor visualización en consola"""
-    
+    """Formatter con colores para mejor visualización en consola.
+
+    Importante: NO muta permanentemente ``record.levelname`` (lo restaura tras
+    formatear). Sin esto, el handler de archivo recibiría el levelname con
+    códigos ANSI incrustados y el log en archivo quedaría corrupto.
+    """
+
     COLORS = {
         'DEBUG': '\033[36m',      # Cyan
         'INFO': '\033[92m',       # Green
@@ -37,51 +42,60 @@ class ColoredFormatter(logging.Formatter):
     }
 
     def format(self, record):
-        log_color = self.COLORS.get(record.levelname, self.COLORS['RESET'])
-        record.levelname = f"{log_color}{record.levelname}{self.COLORS['RESET']}"
-        return super().format(record)
+        color = self.COLORS.get(record.levelname, '')
+        reset = self.COLORS['RESET'] if color else ''
+        # Backup -> mutar -> formatear -> restaurar (evita que los códigos
+        # ANSI se cuelen en el handler de archivo).
+        original_levelname = record.levelname
+        record.levelname = f"{color}{original_levelname}{reset}" if color else original_levelname
+        try:
+            return super().format(record)
+        finally:
+            record.levelname = original_levelname
 
 
-def setup_logging(name: str, log_file: str = None) -> logging.Logger:
-    """Configura logging con salida a consola y archivo opcional"""
-    logger = logging.getLogger(name)
-    logger.setLevel(logging.DEBUG)
-    logger.propagate = False  # No propagar a root logger
-    
-    # Limpiar handlers existentes
-    logger.handlers.clear()
-    
-    # Handler para consola
+def setup_logging(log_file: str = 'bot_trading.log') -> logging.Logger:
+    """Configura el logging global en el **logger raíz**.
+
+    De esta forma TODOS los loggers nombrados que usa el bot
+    (``TradingBot``, ``Bot``, ``Exchange``, ``Technical``, ``Executor``,
+    ``Telegram``) heredan consola + archivo sin necesidad de configurarlos
+    uno por uno. Antes se configuraba solo ``TradingBot`` y los demás se
+    quedaban sin handler, por lo que sus mensajes INFO/DEBUG no se imprimían.
+    """
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+    root.handlers.clear()
+
+    # Handler para consola (con colores)
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.DEBUG)
-    console_format = ColoredFormatter(
+    console_handler.setFormatter(ColoredFormatter(
         '%(asctime)s | %(levelname)-8s | %(name)-15s | %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
-    )
-    console_handler.setFormatter(console_format)
-    logger.addHandler(console_handler)
-    
-    # Handler para archivo (opcional)
+    ))
+    root.addHandler(console_handler)
+
+    # Handler para archivo (sin colores)
     if log_file:
         file_handler = logging.FileHandler(log_file)
         file_handler.setLevel(logging.DEBUG)
-        file_format = logging.Formatter(
+        file_handler.setFormatter(logging.Formatter(
             '%(asctime)s | %(levelname)-8s | %(name)-15s | %(message)s',
             datefmt='%Y-%m-%d %H:%M:%S'
-        )
-        file_handler.setFormatter(file_format)
-        logger.addHandler(file_handler)
-    
-    return logger
+        ))
+        root.addHandler(file_handler)
+
+    # Silenciar logs ruidosos de librerías externas
+    for noisy in ('flask', 'werkzeug', 'urllib3'):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
+
+    # Devolver el logger 'TradingBot' para uso en el bloque __main__
+    return logging.getLogger('TradingBot')
 
 
-# Configurar logging principal
-logger = setup_logging('TradingBot', 'bot_trading.log')
-
-# Silenciar logs de Flask y Werkzeug
-logging.getLogger('flask').setLevel(logging.WARNING)
-logging.getLogger('werkzeug').setLevel(logging.WARNING)
-logging.getLogger('urllib3').setLevel(logging.WARNING)
+# Configurar logging global (root) — afecta a TODOS los loggers del bot
+logger = setup_logging('bot_trading.log')
 
 
 # ============================================================================
@@ -669,12 +683,15 @@ class TradingBot:
     
     def __init__(self, config: BotConfig):
         self.config = config
-        self.logger = logging.getLogger('Bot')
-        
+        # Logger para logs a nivel de ciclo (aparece como 'TradingBot')
+        self.logger = logging.getLogger('TradingBot')
+        # Logger para logs a nivel de símbolo individual (aparece como 'Bot')
+        self.bot_logger = logging.getLogger('Bot')
+
         self.exchange = ExchangeManager(config)
         self.analyzer = TechnicalAnalyzer(config)
         self.executor = TradeExecutor(self.exchange, config)
-        
+
         self.activo = True
         self.ciclo_contador = 0
     
@@ -738,23 +755,23 @@ class TradingBot:
                 self.logger.error(f"❌ {symbol}: No se pudieron extraer indicadores")
                 return False
             
-            # Log de estado detallado
+            # Log de estado detallado (usa bot_logger -> aparece como 'Bot')
             tendencia = "ALCISTA ↗️" if valores.st_direction else "BAJISTA ↘️"
             precio_dist_ema = ((valores.precio_actual - valores.ema200) / valores.ema200) * 100
-            
-            self.logger.info(
+
+            self.bot_logger.info(
                 f"📈 {symbol:15} | "
-                f"Precio: ${valores.precio_actual:12.4f} | "
-                f"EMA200: ${valores.ema200:12.4f} ({precio_dist_ema:+7.2f}%) | "
-                f"ADX: {valores.adx:6.2f} | "
+                f"Precio: ${valores.precio_actual:8.2f} | "
+                f"EMA200: ${valores.ema200:8.2f} ({precio_dist_ema:+6.2f}%) | "
+                f"ADX: {valores.adx:5.2f} | "
                 f"ST: {tendencia}"
             )
-            
+
             # Verificar posición existente
             posicion = self.exchange.obtener_posicion_abierta(symbol)
-            
+
             if posicion:
-                self.logger.info(
+                self.bot_logger.info(
                     f"📌 {symbol}: POSICIÓN ABIERTA ({posicion['side'].upper()}) - "
                     f"{float(posicion['contracts'])} contratos"
                 )
@@ -801,7 +818,7 @@ class TradingBot:
             razon = "SuperTrend cambió a alcista"
         
         if debe_cerrar:
-            self.logger.warning(f"🚨 Señal de SALIDA en {symbol}: {razon}")
+            self.bot_logger.warning(f"🚨 Señal de SALIDA en {symbol}: {razon}")
             self.executor.cerrar_posicion(symbol, posicion, razon)
     
     def ciclo_analisis(self):
