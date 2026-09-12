@@ -1,6 +1,7 @@
 """
 Bot de Trading OKX Testnet - Versión Refactorizada
 Estrategia: SuperTrend + EMA200 + ADX
+MEJORADO EN LOGS POR Z
 """
 
 from datetime import datetime
@@ -86,8 +87,11 @@ def setup_logging(log_file: str = 'bot_trading.log') -> logging.Logger:
         ))
         root.addHandler(file_handler)
 
-    # Silenciar logs ruidosos de librerías externas
-    for noisy in ('flask', 'werkzeug', 'urllib3'):
+    # Silenciar logs ruidosos de librerías externas.
+    # ccxt emite DEBUG con el request/response HTTP completo (incluye API key,
+    # passphrase y signature en texto plano) — subimos a WARNING por seguridad
+    # y para no contaminar la consola.
+    for noisy in ('flask', 'werkzeug', 'urllib3', 'ccxt', 'requests'):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     # Devolver el logger 'TradingBot' para uso en el bloque __main__
