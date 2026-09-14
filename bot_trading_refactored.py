@@ -385,36 +385,72 @@ class ExchangeManager:
             self.logger.error(f"❌ Error creando orden en {symbol}: {e}")
             return False
     
-    def crear_stop_loss(self, symbol: str, side: str, amount: float, 
-                       sl_precio: float) -> bool:
-        """Crea orden de stop loss"""
+    def crear_stop_loss(self, symbol: str, side: str, amount: float,
+                        sl_precio: float) -> bool:
+        """Crea orden de stop loss en OKX.
+
+        OKX requiere una orden **condicional** (tipo ``'conditional'`` o
+        ``'stop'``) con ``triggerPrice`` y ``reduceOnly=True`` para que la
+        orden dispare cuando el precio toca el trigger y solo cierre la
+        posición (no abra una nueva del lado opuesto).
+
+        Estrategia: intenta primero con la forma moderna de ccxt para OKX
+        (``ordType='conditional'`` + ``triggerPrice``). Si falla, reintenta
+        con la forma legacy (``stopPrice``). Devuelve True solo si algún
+        intento funcionó; False si ambos fallan (la posición queda sin SL
+        — el caller DEBE alertar al usuario en ese caso).
+        """
+        side_opuesto = 'sell' if side == 'buy' else 'buy'
+
+        self.logger.info(
+            f"🛡️ Creando SL {side_opuesto.upper()} de {amount} @ {sl_precio:.4f} en {symbol}..."
+        )
+
+        # === Intento 1: forma moderna ccxt/OKX (conditional + triggerPrice) ===
         try:
-            side_opuesto = 'sell' if side == 'buy' else 'buy'
-            
-            self.logger.debug(
-                f"Creando SL {side_opuesto.upper()} de {amount} @ {sl_precio:.4f}..."
-            )
-            
-            # Intenta con parámetros estándar de OKX
             self.exchange.create_order(
                 symbol,
-                'market',
+                'stop',  # OKX: orden condicional
                 side_opuesto,
                 amount,
-                None,  # precio
+                None,
+                params={
+                    'triggerPrice': sl_precio,
+                    'stopPrice': sl_precio,  # backup para compatibilidad
+                    'reduceOnly': True,
+                    'ordType': 'conditional',
+                }
+            )
+            self.logger.info(f"✓ SL creado en {symbol} @ {sl_precio:.4f} (vía conditional)")
+            return True
+        except Exception as e1:
+            self.logger.warning(
+                f"⚠️ SL intento 1 (conditional) falló en {symbol}: {e1}"
+            )
+
+        # === Intento 2: forma legacy (stopPrice en una orden 'market' reduceOnly) ===
+        try:
+            self.exchange.create_order(
+                symbol,
+                'stop',
+                side_opuesto,
+                amount,
+                sl_precio,  # precio = trigger para stop legacy
                 params={
                     'stopPrice': sl_precio,
                     'triggerPrice': sl_precio,
                     'reduceOnly': True,
                 }
             )
-            
-            self.logger.info(f"✓ Stop loss creado en {symbol} @ {sl_precio:.4f}")
+            self.logger.info(f"✓ SL creado en {symbol} @ {sl_precio:.4f} (vía legacy)")
             return True
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error creando SL en {symbol}: {e}")
-            # Continúa sin SL pero registra el error
+        except Exception as e2:
+            self.logger.error(
+                f"❌ SL falló ambos intentos en {symbol}:\n"
+                f"   intento 1 (conditional): {e1}\n"
+                f"   intento 2 (legacy):      {e2}"
+            )
+            self.logger.debug(traceback.format_exc())
             return False
 
 
@@ -632,22 +668,41 @@ class TradeExecutor:
             # Crear orden de entrada
             if not self.exchange.crear_orden_mercado(symbol, side, amount):
                 return False
-            
-            # Crear stop loss
-            self.exchange.crear_stop_loss(symbol, side, amount, sl_precio)
-            
+
+            # Crear stop loss — y verificar que se haya creado
+            sl_creado = self.exchange.crear_stop_loss(symbol, side, amount, sl_precio)
+
             # Notificar
-            msg = (
-                f"🟢 NUEVA OPERACIÓN ({symbol})\n"
-                f"Dirección: {direction.value.upper()}\n"
-                f"Tamaño: {amount} contratos\n"
-                f"Entrada: {precio_mercado:.4f}\n"
-                f"SL: {sl_precio:.4f}\n"
-                f"ADX: {valores.adx:.2f}"
-            )
+            if sl_creado:
+                msg = (
+                    f"🟢 NUEVA OPERACIÓN ({symbol})\n"
+                    f"Dirección: {direction.value.upper()}\n"
+                    f"Tamaño: {amount} contratos\n"
+                    f"Entrada: {precio_mercado:.4f}\n"
+                    f"SL: {sl_precio:.4f}\n"
+                    f"ADX: {valores.adx:.2f}"
+                )
+            else:
+                # El SL no se pudo crear en el exchange — alertar al usuario
+                # para que lo setee manualmente. La posición YA está abierta.
+                msg = (
+                    f"🟢 NUEVA OPERACIÓN ({symbol})\n"
+                    f"Dirección: {direction.value.upper()}\n"
+                    f"Tamaño: {amount} contratos\n"
+                    f"Entrada: {precio_mercado:.4f}\n"
+                    f"ADX: {valores.adx:.2f}\n"
+                    f"\n"
+                    f"🚨 ALERTA: el SL en {sl_precio:.4f} NO se pudo crear en OKX.\n"
+                    f"Setealo MANUALMENTE en la interfaz del exchange.\n"
+                    f"El bot cerrará la posición cuando ST revierta, pero si\n"
+                    f"el bot se cae no hay protección del lado del exchange."
+                )
+                self.logger.error(
+                    f"🚨 SL NO creado en {symbol} — position abierta sin protección!"
+                )
             self.logger.info(msg)
             notifier.enviar(msg, "TRADE")
-            
+
             return True
             
         except Exception as e:
