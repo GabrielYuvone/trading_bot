@@ -397,10 +397,16 @@ class ExchangeManager:
         Estrategia: intenta primero con la forma moderna de ccxt para OKX
         (``ordType='conditional'`` + ``triggerPrice``). Si falla, reintenta
         con la forma legacy (``stopPrice``). Devuelve True solo si algún
-        intento funcionó; False si ambos fallan (la posición queda sin SL
-        — el caller DEBE alertar al usuario en ese caso).
+        intento funcionó; False si ambos fallan.
+
+        Importante: en Python 3, las variables asignadas con
+        ``except Exception as e`` se eliminan al salir del bloque except
+        (PEP 3110). Por eso usamos una lista ``errores`` que persiste fuera
+        de los handlers, en lugar de referenciar ``e1`` desde el segundo
+        ``except`` (eso causaba ``cannot access local variable 'e1'``).
         """
         side_opuesto = 'sell' if side == 'buy' else 'buy'
+        errores = []  # acumula mensajes de error de cada intento
 
         self.logger.info(
             f"🛡️ Creando SL {side_opuesto.upper()} de {amount} @ {sl_precio:.4f} en {symbol}..."
@@ -424,11 +430,13 @@ class ExchangeManager:
             self.logger.info(f"✓ SL creado en {symbol} @ {sl_precio:.4f} (vía conditional)")
             return True
         except Exception as e1:
+            err_msg = str(e1)
+            errores.append(f"intento 1 (conditional): {err_msg}")
             self.logger.warning(
-                f"⚠️ SL intento 1 (conditional) falló en {symbol}: {e1}"
+                f"⚠️ SL intento 1 (conditional) falló en {symbol}: {err_msg}"
             )
 
-        # === Intento 2: forma legacy (stopPrice en una orden 'market' reduceOnly) ===
+        # === Intento 2: forma legacy (stopPrice en una orden 'stop' reduceOnly) ===
         try:
             self.exchange.create_order(
                 symbol,
@@ -445,10 +453,11 @@ class ExchangeManager:
             self.logger.info(f"✓ SL creado en {symbol} @ {sl_precio:.4f} (vía legacy)")
             return True
         except Exception as e2:
+            err_msg = str(e2)
+            errores.append(f"intento 2 (legacy): {err_msg}")
             self.logger.error(
-                f"❌ SL falló ambos intentos en {symbol}:\n"
-                f"   intento 1 (conditional): {e1}\n"
-                f"   intento 2 (legacy):      {e2}"
+                f"❌ SL falló ambos intentos en {symbol}:\n   "
+                + "\n   ".join(errores)
             )
             self.logger.debug(traceback.format_exc())
             return False
@@ -672,8 +681,8 @@ class TradeExecutor:
             # Crear stop loss — y verificar que se haya creado
             sl_creado = self.exchange.crear_stop_loss(symbol, side, amount, sl_precio)
 
-            # Notificar
             if sl_creado:
+                # Todo OK: notify y terminar
                 msg = (
                     f"🟢 NUEVA OPERACIÓN ({symbol})\n"
                     f"Dirección: {direction.value.upper()}\n"
@@ -682,28 +691,46 @@ class TradeExecutor:
                     f"SL: {sl_precio:.4f}\n"
                     f"ADX: {valores.adx:.2f}"
                 )
-            else:
-                # El SL no se pudo crear en el exchange — alertar al usuario
-                # para que lo setee manualmente. La posición YA está abierta.
-                msg = (
-                    f"🟢 NUEVA OPERACIÓN ({symbol})\n"
-                    f"Dirección: {direction.value.upper()}\n"
-                    f"Tamaño: {amount} contratos\n"
-                    f"Entrada: {precio_mercado:.4f}\n"
-                    f"ADX: {valores.adx:.2f}\n"
-                    f"\n"
-                    f"🚨 ALERTA: el SL en {sl_precio:.4f} NO se pudo crear en OKX.\n"
-                    f"Setealo MANUALMENTE en la interfaz del exchange.\n"
-                    f"El bot cerrará la posición cuando ST revierta, pero si\n"
-                    f"el bot se cae no hay protección del lado del exchange."
-                )
-                self.logger.error(
-                    f"🚨 SL NO creado en {symbol} — position abierta sin protección!"
-                )
-            self.logger.info(msg)
-            notifier.enviar(msg, "TRADE")
+                self.logger.info(msg)
+                notifier.enviar(msg, "TRADE")
+                return True
 
-            return True
+            # === SL NO se pudo crear ===
+            # Política de seguridad: una posición sin SL es inaceptable porque
+            # si el bot se cae, no hay nada que la cierre del lado del exchange.
+            # Cerramos la posición recién abierta y notificamos al usuario.
+            self.logger.error(
+                f"🚨 SL NO creado en {symbol} — cerrando posición recién abierta "
+                f"para evitar posición desprotegida."
+            )
+            side_cierre = 'sell' if side == 'buy' else 'buy'
+            cierre_ok = self.exchange.crear_orden_mercado(symbol, side_cierre, amount)
+
+            if cierre_ok:
+                msg = (
+                    f"🚨 OPERACIÓN CANCELADA ({symbol})\n"
+                    f"Se abrió {direction.value.upper()} @ {precio_mercado:.4f} "
+                    f"pero el SL NO se pudo crear en OKX.\n"
+                    f"Para evitar una posición desprotegida, el bot cerró la "
+                    f"operación inmediatamente.\n"
+                    f"\n"
+                    f"Revisá los logs para ver el error exacto del SL."
+                )
+            else:
+                msg = (
+                    f"🚨🚨 EMERGENCIA ({symbol})\n"
+                    f"Se abrió {direction.value.upper()} @ {precio_mercado:.4f}.\n"
+                    f"NO se pudo crear el SL.\n"
+                    f"TAMPOCO se pudo cerrar la posición automáticamente.\n"
+                    f"CERRÁ LA POSICIÓN MANUALMENTE EN OKX AHORA."
+                )
+                self.logger.critical(
+                    f"🚨🚨 {symbol}: ni SL ni cierre manual funcionaron — "
+                    f"posición desprotegida, requiere intervención humana"
+                )
+            self.logger.error(msg)
+            notifier.enviar(msg, "ERROR")
+            return False
             
         except Exception as e:
             self.logger.error(f"❌ Error abriendo posición en {symbol}: {e}")
