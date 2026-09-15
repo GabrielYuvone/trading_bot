@@ -305,10 +305,26 @@ class ExchangeManager:
             raise
     
     def configurar_mercado(self, symbol: str) -> bool:
-        """Configura un mercado específico"""
+        """Configura un mercado específico: margen AISLADO + apalancamiento.
+
+        Margin mode **Aislado** (no Cruzado): si la posición se liquidara,
+        solo se pierde el margen asignado a esa operación (~$50), no el
+        balance total de la cuenta. Para un bot con 50x y SL inestable,
+        esto es crítico — evita que una posición desprotegida vacíe toda
+        la cuenta si el bot se cae.
+        """
         try:
+            # 1) Margin mode aislado
+            try:
+                self.exchange.set_margin_mode('isolated', symbol)
+                self.logger.info(f"✓ {symbol}: Margen AISLADO configurado")
+            except Exception as e:
+                # OKX devuelve error si ya está en ese modo — no es crítico
+                self.logger.debug(f"{symbol}: margen ya aislado o no se pudo cambiar: {e}")
+
+            # 2) Apalancamiento
             self.exchange.set_leverage(self.config.leverage, symbol)
-            self.logger.info(f"✓ {symbol}: Apalancamiento configurado a {self.config.leverage}x")
+            self.logger.info(f"✓ {symbol}: Apalancamiento {self.config.leverage}x")
             return True
         except ccxt.BadSymbol:
             self.logger.error(f"❌ Símbolo inválido: {symbol}")
@@ -796,6 +812,17 @@ class TradingBot:
         self.ultimo_reporte_ts = None
         # Estado actual de cada símbolo: {symbol: {precio, st, adx, posicion, razon}}
         self.estado_simbolos = {}
+
+        # === Cooldown de señales (evita re-entrar en la misma señal) ===
+        # Diccionario {symbol: timestamp_última_señal_procesada}
+        # Una vez que el bot procesó una señal (entró o falló al entrar),
+        # no vuelve a considerar señales para ese símbolo hasta que pase
+        # `cooldown_segundos` O hasta que cambie la dirección de ST.
+        # Esto evita el loop "entra → rollback → vuelve a entrar" cuando
+        # el SL falla y la señal sigue activa en velas de 1h.
+        self.ultima_senal_ts = {}
+        self.ultima_senal_direccion = {}
+        self.cooldown_segundos = 300  # 5 minutos — configurable
     
     def inicializar(self) -> bool:
         """Inicializa el bot"""
@@ -909,19 +936,39 @@ class TradingBot:
             señal_direccion = self.analyzer.detectar_señal(valores)
             
             if señal_direccion != TrendDirection.NEUTRAL:
-                signal = TradeSignal(
-                    symbol=symbol,
-                    direction=señal_direccion,
-                    precio=valores.precio_actual,
-                    adx=valores.adx,
-                    timestamp=datetime.now()
-                )
-                self.logger.warning("")
-                self.logger.warning("🎯🎯🎯 SEÑAL DETECTADA 🎯🎯🎯")
-                self.logger.warning(f"🎯 NUEVA SEÑAL: {signal}")
-                self.logger.warning("🎯🎯🎯 NUEVA SEÑAL 🎯🎯🎯")
-                self.logger.warning("")
-                self.executor.abrir_posicion(signal, valores)
+                # === Verificar cooldown antes de actuar ===
+                # Si ya procesamos esta misma señal en los últimos
+                # `cooldown_segundos` y la dirección de ST no cambió,
+                # NO re-entrar. Evita el loop "entra → rollback → entra"
+                # cuando el SL falla y la señal sigue activa.
+                ahora_ts = datetime.now().timestamp()
+                ultima_ts = self.ultima_senal_ts.get(symbol, 0)
+                ultima_dir = self.ultima_senal_direccion.get(symbol)
+                segundos_desde_ultima = ahora_ts - ultima_ts
+
+                if (ultima_dir == señal_direccion.value and
+                    segundos_desde_ultima < self.cooldown_segundos):
+                    self.bot_logger.info(
+                        f"⏸️  {symbol}: señal {señal_direccion.value.upper()} activa "
+                        f"pero en cooldown ({int(self.cooldown_segundos - segundos_desde_ultima)}s restantes)"
+                    )
+                else:
+                    signal = TradeSignal(
+                        symbol=symbol,
+                        direction=señal_direccion,
+                        precio=valores.precio_actual,
+                        adx=valores.adx,
+                        timestamp=datetime.now()
+                    )
+                    self.logger.warning("")
+                    self.logger.warning("🎯🎯🎯 SEÑAL DETECTADA 🎯🎯🎯")
+                    self.logger.warning(f"🎯 NUEVA SEÑAL: {signal}")
+                    self.logger.warning("🎯🎯🎯 NUEVA SEÑAL 🎯🎯🎯")
+                    self.logger.warning("")
+                    # Registrar que procesamos esta señal (cooldown)
+                    self.ultima_senal_ts[symbol] = ahora_ts
+                    self.ultima_senal_direccion[symbol] = señal_direccion.value
+                    self.executor.abrir_posicion(signal, valores)
             
             return True
             
