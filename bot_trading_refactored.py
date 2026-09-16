@@ -403,77 +403,88 @@ class ExchangeManager:
     
     def crear_stop_loss(self, symbol: str, side: str, amount: float,
                         sl_precio: float) -> bool:
-        """Crea orden de stop loss en OKX.
+        """Crea orden de Stop Loss en OKX usando el endpoint nativo de algo orders.
 
-        OKX requiere una orden **condicional** (tipo ``'conditional'`` o
-        ``'stop'``) con ``triggerPrice`` y ``reduceOnly=True`` para que la
-        orden dispare cuando el precio toca el trigger y solo cierre la
-        posición (no abra una nueva del lado opuesto).
+        OKX tiene DOS endpoints para crear órdenes:
+        - `/api/v5/trade/order` — órdenes regulares (market, limit).
+          ccxt usa este por defecto. NO acepta bien el flag `reduceOnly`
+          en swap (devuelve ``51205 Reduce Only is not available``).
+        - `/api/v5/trade/order-algo` — órdenes condicionales (SL, TP,
+          trailing stop, etc.). Es el ÚNICO endpoint que funciona
+          para poner SL en OKX swap.
 
-        Estrategia: intenta primero con la forma moderna de ccxt para OKX
-        (``ordType='conditional'`` + ``triggerPrice``). Si falla, reintenta
-        con la forma legacy (``stopPrice``). Devuelve True solo si algún
-        intento funcionó; False si ambos fallan.
+        ccxt no maneja bien el endpoint de algo orders, así que usamos
+        la API privada directa: ``ex.private_post_trade_order_algo(...)``.
 
-        Importante: en Python 3, las variables asignadas con
-        ``except Exception as e`` se eliminan al salir del bloque except
-        (PEP 3110). Por eso usamos una lista ``errores`` que persiste fuera
-        de los handlers, en lugar de referenciar ``e1`` desde el segundo
-        ``except`` (eso causaba ``cannot access local variable 'e1'``).
+        Parámetros OKX requeridos:
+        - instId:          'BTC-USDT-SWAP' (formato OKX, no 'BTC/USDT:USDT')
+        - tdMode:          'cross' o 'isolated' (margen)
+        - side:            'buy' o 'sell' (lado de CIERRE, opuesto al entry)
+        - posSide:         'net' (en modo single-position)
+        - ordType:         'conditional' (SL simple, un solo trigger)
+        - sz:              tamaño en string (OKX exige string)
+        - slTriggerPx:     precio que dispara el SL
+        - slOrdPx:         '-1' = ejecutar como MARKET al dispararse
+                           (este es el truco — sin esto, pide orderPx)
+        - tradeSide:       'close' (siempre — la orden es para cerrar)
+
+        Devuelve True si OKX aceptó el SL, False si falló.
         """
         side_opuesto = 'sell' if side == 'buy' else 'buy'
-        errores = []  # acumula mensajes de error de cada intento
 
         self.logger.info(
-            f"🛡️ Creando SL {side_opuesto.upper()} de {amount} @ {sl_precio:.4f} en {symbol}..."
+            f"🛡️ Creando SL {side_opuesto.upper()} de {amount} @ {sl_precio:.4f} "
+            f"en {symbol} (vía order-algo)..."
         )
 
-        # === Intento 1: forma moderna ccxt/OKX (conditional + triggerPrice) ===
         try:
-            self.exchange.create_order(
-                symbol,
-                'stop',  # OKX: orden condicional
-                side_opuesto,
-                amount,
-                None,
-                params={
-                    'triggerPrice': sl_precio,
-                    'stopPrice': sl_precio,  # backup para compatibilidad
-                    'reduceOnly': True,
-                    'ordType': 'conditional',
-                }
-            )
-            self.logger.info(f"✓ SL creado en {symbol} @ {sl_precio:.4f} (vía conditional)")
-            return True
-        except Exception as e1:
-            err_msg = str(e1)
-            errores.append(f"intento 1 (conditional): {err_msg}")
-            self.logger.warning(
-                f"⚠️ SL intento 1 (conditional) falló en {symbol}: {err_msg}"
-            )
+            # Obtener el instId en formato OKX (BTC-USDT-SWAP) y el tdMode
+            market = self.exchange.market(symbol)
+            inst_id = market['id']
 
-        # === Intento 2: forma legacy (stopPrice en una orden 'stop' reduceOnly) ===
-        try:
-            self.exchange.create_order(
-                symbol,
-                'stop',
-                side_opuesto,
-                amount,
-                sl_precio,  # precio = trigger para stop legacy
-                params={
-                    'stopPrice': sl_precio,
-                    'triggerPrice': sl_precio,
-                    'reduceOnly': True,
-                }
-            )
-            self.logger.info(f"✓ SL creado en {symbol} @ {sl_precio:.4f} (vía legacy)")
-            return True
-        except Exception as e2:
-            err_msg = str(e2)
-            errores.append(f"intento 2 (legacy): {err_msg}")
+            # Determinar tdMode según config del mercado
+            # En testnet, normalmente 'cross'. Si configuramos isolated arriba,
+            # usamos 'isolated'. Para ser seguro, leerlo del market info.
+            td_mode = 'isolated'  # cambiamos a isolated en configurar_mercado
+            # Si por algún motivo el mercado está en cross, OKX igual lo acepta
+            # con 'cross' o 'isolated' — el que esté activo
+
+            # Llamar al endpoint nativo de OKX
+            response = self.exchange.private_post_trade_order_algo({
+                'instId': inst_id,
+                'tdMode': td_mode,
+                'side': side_opuesto,
+                'posSide': 'net',
+                'ordType': 'conditional',
+                'sz': str(amount),
+                'slTriggerPx': str(sl_precio),
+                'slOrdPx': '-1',  # market al dispararse
+                'tradeSide': 'close',
+            })
+
+            # OKX devuelve {'code': '0', 'data': [{'algoId': '...', 'sCode': '0', ...}]}
+            code = response.get('code', '?')
+            if code == '0':
+                data = response.get('data', [{}])
+                algo_id = data[0].get('algoId', '?') if data else '?'
+                self.logger.info(
+                    f"✓ SL creado en {symbol} @ {sl_precio:.4f} "
+                    f"(algoId={algo_id})"
+                )
+                return True
+            else:
+                msg = response.get('msg', 'Error desconocido OKX')
+                sMsg = ''
+                if response.get('data'):
+                    sMsg = response['data'][0].get('sMsg', '')
+                err_full = f"code={code} msg={msg} sMsg={sMsg}"
+                self.logger.error(f"❌ SL rechazado por OKX en {symbol}: {err_full}")
+                return False
+
+        except Exception as e:
+            err_msg = str(e)
             self.logger.error(
-                f"❌ SL falló ambos intentos en {symbol}:\n   "
-                + "\n   ".join(errores)
+                f"❌ Error creando SL en {symbol} (order-algo): {err_msg}"
             )
             self.logger.debug(traceback.format_exc())
             return False
