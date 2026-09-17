@@ -1,6 +1,6 @@
 """
 Bot de Trading OKX Testnet - Versión Refactorizada
-Estrategia: SuperTrend + EMA200 + ADX
+Estrategia: SuperTrend + EMA200 + ADX - check
 """
 
 from datetime import datetime, timedelta, timezone
