@@ -1,6 +1,6 @@
 """
 Bot de Trading OKX Testnet - Versión Refactorizada
-Estrategia: SuperTrend + EMA200 + ADX - check
+Estrategia: SuperTrend + EMA200 + ADX
 """
 
 from datetime import datetime, timedelta, timezone
@@ -169,7 +169,8 @@ class BotConfig:
     timeframe: str = '1h'
     leverage: int = 50
     capital_riesgo_usdt: float = 50.0
-    porcentaje_sl: float = 0.015
+    porcentaje_sl: float = 0.015  # 1.5% stop loss
+    porcentaje_tp: float = 0.03   # 3.0% take profit (riesgo:beneficio 1:2)
     
     # Indicadores
     st_periodo: int = 10
@@ -184,7 +185,7 @@ class BotConfig:
     
     def __post_init__(self):
         if self.simbolos is None:
-            self.simbolos = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT', 'AVAX/USDT:USDT']
+            self.simbolos = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']
     
     @classmethod
     def desde_env(cls) -> 'BotConfig':
@@ -401,9 +402,10 @@ class ExchangeManager:
             self.logger.error(f"❌ Error creando orden en {symbol}: {e}")
             return False
     
-    def crear_stop_loss(self, symbol: str, side: str, amount: float,
-                        sl_precio: float) -> bool:
-        """Crea orden de Stop Loss en OKX usando el endpoint nativo de algo orders.
+    def crear_tp_sl(self, symbol: str, side: str, amount: float,
+                    sl_precio: float, tp_precio: float) -> tuple:
+        """Crea órdenes de Stop Loss y Take Profit en OKX usando el endpoint
+        nativo de algo orders.
 
         OKX tiene DOS endpoints para crear órdenes:
         - `/api/v5/trade/order` — órdenes regulares (market, limit).
@@ -411,45 +413,39 @@ class ExchangeManager:
           en swap (devuelve ``51205 Reduce Only is not available``).
         - `/api/v5/trade/order-algo` — órdenes condicionales (SL, TP,
           trailing stop, etc.). Es el ÚNICO endpoint que funciona
-          para poner SL en OKX swap.
+          para poner SL/TP en OKX swap.
 
-        ccxt no maneja bien el endpoint de algo orders, así que usamos
-        la API privada directa: ``ex.private_post_trade_order_algo(...)``.
+        Parámetros OKX requeridos para ``conditional`` (SL o TP simple):
+        - instId:      'BTC-USDT-SWAP' (formato OKX, no 'BTC/USDT:USDT')
+        - tdMode:      'cross' o 'isolated' (margen)
+        - side:        'buy' o 'sell' (lado de CIERRE, opuesto al entry)
+        - posSide:     'net' (en modo single-position)
+        - ordType:     'conditional' (SL/TP simple, un solo trigger)
+        - sz:          tamaño en string (OKX exige string)
+        - slTriggerPx: precio que dispara el SL (opcional si solo TP)
+        - slOrdPx:     '-1' = ejecutar como MARKET al dispararse
+        - tpTriggerPx: precio que dispara el TP (opcional si solo SL)
+        - tpOrdPx:     '-1' = ejecutar como MARKET al dispararse
+        - tradeSide:   'close' (siempre — la orden es para cerrar)
 
-        Parámetros OKX requeridos:
-        - instId:          'BTC-USDT-SWAP' (formato OKX, no 'BTC/USDT:USDT')
-        - tdMode:          'cross' o 'isolated' (margen)
-        - side:            'buy' o 'sell' (lado de CIERRE, opuesto al entry)
-        - posSide:         'net' (en modo single-position)
-        - ordType:         'conditional' (SL simple, un solo trigger)
-        - sz:              tamaño en string (OKX exige string)
-        - slTriggerPx:     precio que dispara el SL
-        - slOrdPx:         '-1' = ejecutar como MARKET al dispararse
-                           (este es el truco — sin esto, pide orderPx)
-        - tradeSide:       'close' (siempre — la orden es para cerrar)
-
-        Devuelve True si OKX aceptó el SL, False si falló.
+        Devuelve (sl_ok: bool, tp_ok: bool) — independientemente si cada
+        una se creó bien o falló.
         """
         side_opuesto = 'sell' if side == 'buy' else 'buy'
 
         self.logger.info(
-            f"🛡️ Creando SL {side_opuesto.upper()} de {amount} @ {sl_precio:.4f} "
-            f"en {symbol} (vía order-algo)..."
+            f"🛡️ Creando SL @ {sl_precio:.4f} + TP @ {tp_precio:.4f} "
+            f"({side_opuesto.upper()} {amount} {symbol})..."
         )
 
+        market = self.exchange.market(symbol)
+        inst_id = market['id']
+        td_mode = 'isolated'
+
+        # === Crear SL ===
+        sl_ok = False
+        sl_algo_id = None
         try:
-            # Obtener el instId en formato OKX (BTC-USDT-SWAP) y el tdMode
-            market = self.exchange.market(symbol)
-            inst_id = market['id']
-
-            # Determinar tdMode según config del mercado
-            # En testnet, normalmente 'cross'. Si configuramos isolated arriba,
-            # usamos 'isolated'. Para ser seguro, leerlo del market info.
-            td_mode = 'isolated'  # cambiamos a isolated en configurar_mercado
-            # Si por algún motivo el mercado está en cross, OKX igual lo acepta
-            # con 'cross' o 'isolated' — el que esté activo
-
-            # Llamar al endpoint nativo de OKX
             response = self.exchange.private_post_trade_order_algo({
                 'instId': inst_id,
                 'tdMode': td_mode,
@@ -458,35 +454,85 @@ class ExchangeManager:
                 'ordType': 'conditional',
                 'sz': str(amount),
                 'slTriggerPx': str(sl_precio),
-                'slOrdPx': '-1',  # market al dispararse
+                'slOrdPx': '-1',
                 'tradeSide': 'close',
             })
-
-            # OKX devuelve {'code': '0', 'data': [{'algoId': '...', 'sCode': '0', ...}]}
-            code = response.get('code', '?')
-            if code == '0':
+            if response.get('code') == '0':
                 data = response.get('data', [{}])
-                algo_id = data[0].get('algoId', '?') if data else '?'
-                self.logger.info(
-                    f"✓ SL creado en {symbol} @ {sl_precio:.4f} "
-                    f"(algoId={algo_id})"
-                )
-                return True
+                sl_algo_id = data[0].get('algoId', '?') if data else '?'
+                self.logger.info(f"✓ SL creado @ {sl_precio:.4f} (algoId={sl_algo_id})")
+                sl_ok = True
             else:
-                msg = response.get('msg', 'Error desconocido OKX')
+                msg = response.get('msg', '')
                 sMsg = ''
                 if response.get('data'):
                     sMsg = response['data'][0].get('sMsg', '')
-                err_full = f"code={code} msg={msg} sMsg={sMsg}"
-                self.logger.error(f"❌ SL rechazado por OKX en {symbol}: {err_full}")
-                return False
-
+                self.logger.error(f"❌ SL rechazado: code={response.get('code')} msg={msg} sMsg={sMsg}")
         except Exception as e:
-            err_msg = str(e)
-            self.logger.error(
-                f"❌ Error creando SL en {symbol} (order-algo): {err_msg}"
-            )
+            self.logger.error(f"❌ Error creando SL: {e}")
             self.logger.debug(traceback.format_exc())
+
+        # === Crear TP ===
+        tp_ok = False
+        tp_algo_id = None
+        try:
+            response = self.exchange.private_post_trade_order_algo({
+                'instId': inst_id,
+                'tdMode': td_mode,
+                'side': side_opuesto,
+                'posSide': 'net',
+                'ordType': 'conditional',
+                'sz': str(amount),
+                'tpTriggerPx': str(tp_precio),
+                'tpOrdPx': '-1',
+                'tradeSide': 'close',
+            })
+            if response.get('code') == '0':
+                data = response.get('data', [{}])
+                tp_algo_id = data[0].get('algoId', '?') if data else '?'
+                self.logger.info(f"✓ TP creado @ {tp_precio:.4f} (algoId={tp_algo_id})")
+                tp_ok = True
+            else:
+                msg = response.get('msg', '')
+                sMsg = ''
+                if response.get('data'):
+                    sMsg = response['data'][0].get('sMsg', '')
+                self.logger.error(f"❌ TP rechazado: code={response.get('code')} msg={msg} sMsg={sMsg}")
+        except Exception as e:
+            self.logger.error(f"❌ Error creando TP: {e}")
+            self.logger.debug(traceback.format_exc())
+
+        return sl_ok, tp_ok
+
+    # Mantener alias por compatibilidad (código viejo que lo llama)
+    def crear_stop_loss(self, symbol: str, side: str, amount: float,
+                        sl_precio: float) -> bool:
+        """Wrapper legacy: crea solo SL (sin TP). Devuelve True si OK."""
+        # Calcula un TP dummy que no se va a usar; el caller solo ve el SL
+        # Mejor: redirigir a crear_tp_sl y devolver solo el estado del SL
+        # Pero como no tenemos el TP acá, creamos solo SL vía order-algo
+        side_opuesto = 'sell' if side == 'buy' else 'buy'
+        try:
+            market = self.exchange.market(symbol)
+            response = self.exchange.private_post_trade_order_algo({
+                'instId': market['id'],
+                'tdMode': 'isolated',
+                'side': side_opuesto,
+                'posSide': 'net',
+                'ordType': 'conditional',
+                'sz': str(amount),
+                'slTriggerPx': str(sl_precio),
+                'slOrdPx': '-1',
+                'tradeSide': 'close',
+            })
+            if response.get('code') == '0':
+                self.logger.info(f"✓ SL creado @ {sl_precio:.4f}")
+                return True
+            else:
+                self.logger.error(f"❌ SL rechazado: {response}")
+                return False
+        except Exception as e:
+            self.logger.error(f"❌ Error creando SL: {e}")
             return False
 
 
@@ -693,29 +739,35 @@ class TradeExecutor:
             if not amount:
                 return False
             
-            # Calcular stop loss
+            # Calcular stop loss y take profit
             if direction == TrendDirection.UPTREND:
                 sl_precio = precio_mercado * (1 - self.config.porcentaje_sl)
+                tp_precio = precio_mercado * (1 + self.config.porcentaje_tp)
                 side = 'buy'
             else:
                 sl_precio = precio_mercado * (1 + self.config.porcentaje_sl)
+                tp_precio = precio_mercado * (1 - self.config.porcentaje_tp)
                 side = 'sell'
             
             # Crear orden de entrada
             if not self.exchange.crear_orden_mercado(symbol, side, amount):
                 return False
 
-            # Crear stop loss — y verificar que se haya creado
-            sl_creado = self.exchange.crear_stop_loss(symbol, side, amount, sl_precio)
+            # Crear SL + TP — y verificar que se hayan creado
+            sl_creado, tp_creado = self.exchange.crear_tp_sl(
+                symbol, side, amount, sl_precio, tp_precio
+            )
 
             if sl_creado:
-                # Todo OK: notify y terminar
+                # SL OK — notificar con el estado del TP
+                tp_status = f"TP: {tp_precio:.4f}" if tp_creado else "⚠️ TP no creado"
                 msg = (
                     f"🟢 NUEVA OPERACIÓN ({symbol})\n"
                     f"Dirección: {direction.value.upper()}\n"
                     f"Tamaño: {amount} contratos\n"
                     f"Entrada: {precio_mercado:.4f}\n"
                     f"SL: {sl_precio:.4f}\n"
+                    f"{tp_status}\n"
                     f"ADX: {valores.adx:.2f}"
                 )
                 self.logger.info(msg)
