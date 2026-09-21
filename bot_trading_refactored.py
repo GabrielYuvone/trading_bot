@@ -185,7 +185,7 @@ class BotConfig:
     
     def __post_init__(self):
         if self.simbolos is None:
-            self.simbolos = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT']
+            self.simbolos = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT', 'AVAX/USDT:USDT']
     
     @classmethod
     def desde_env(cls) -> 'BotConfig':
