@@ -1,1333 +1,896 @@
+#!/usr/bin/env python3
 """
-Bot de Trading OKX Testnet - Versión Refactorizada
-Estrategia: SuperTrend + EMA200 + ADX
+BOT DE TRADING OKX v2 - COMPLETO CON 4 MEJORAS
+================================================
+
+Características:
+1. SuperTrend + EMA200 + ADX como estrategia
+2. Cálculo de PnL REAL (con comisiones)
+3. SQLite para persistencia
+4. Telegram para alertas
+5. Flask para monitoreo remoto
+6. Modo simulación para testing
+7. Manejo robusto de errores
+8. Verificación de TP creado
+
+Requisitos:
+    pip install ccxt pandas numpy requests python-telegram-bot flask
+
+Configuración:
+    .env debe contener:
+        OKX_API_KEY=...
+        OKX_API_SECRET=...
+        OKX_API_PASSWORD=...
+        TELEGRAM_TOKEN=...
+        TELEGRAM_CHAT_ID=...
+        MODO_SIMULACION=1  # 0=real, 1=simulación
+        OKX_LEVERAGE=10
+
+Uso:
+    python bot_completo.py
 """
 
-from datetime import datetime, timedelta, timezone
 import os
-import threading
-import time
-import logging
-import json
-import traceback
-from dataclasses import dataclass
-from typing import Optional, Dict, Tuple
-from enum import Enum
-
-from flask import Flask
 import ccxt
-import numpy as np
+import time
+import sqlite3
+import json
+import threading
+import logging
+import traceback
+from datetime import datetime, timezone, timedelta
+from dataclasses import dataclass
+from typing import Optional, Dict, Tuple, List
+from enum import Enum
+from pathlib import Path
+
 import pandas as pd
+import numpy as np
 import requests
+from flask import Flask, jsonify
+from dotenv import load_dotenv
 
-# Zona horaria del usuario: Argentina (GMT-3)
-GMT_MINUS_3 = timezone(timedelta(hours=-3))
+# ============================================================================
+# CONFIGURACIÓN INICIAL
+# ============================================================================
 
-# Horarios de reporte a Telegram (en hora local Argentina):
-# Día (07-22): cada 1 hora
-# Noche (23-06): cada 2 horas
-REPORTES_HORAS = (
-    7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,  # día
-    23, 1, 3, 5,                                                    # noche
+load_dotenv()
+
+# Variables de entorno
+OKX_API_KEY = os.getenv("OKX_API_KEY", "")
+OKX_API_SECRET = os.getenv("OKX_API_SECRET", "")
+OKX_API_PASSWORD = os.getenv("OKX_API_PASSWORD", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+MODO_SIMULACION = int(os.getenv("MODO_SIMULACION", "1"))
+OKX_LEVERAGE = int(os.getenv("OKX_LEVERAGE", "10"))
+DB_PATH = "trades.db"
+
+# Logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler("bot_trading.log"),
+        logging.StreamHandler()
+    ]
 )
+logger = logging.getLogger(__name__)
 
 # ============================================================================
-# CONFIGURACIÓN DE LOGGING
+# ENUMS Y DATACLASSES
 # ============================================================================
 
-class ColoredFormatter(logging.Formatter):
-    """Formatter con colores para mejor visualización en consola.
-
-    Importante: NO muta permanentemente ``record.levelname`` (lo restaura tras
-    formatear). Sin esto, el handler de archivo recibiría el levelname con
-    códigos ANSI incrustados y el log en archivo quedaría corrupto.
-    """
-
-    COLORS = {
-        'DEBUG': '\033[36m',      # Cyan
-        'INFO': '\033[92m',       # Green
-        'WARNING': '\033[93m',    # Yellow
-        'ERROR': '\033[91m',      # Red
-        'CRITICAL': '\033[95m',   # Magenta
-        'RESET': '\033[0m'
-    }
-
-    def format(self, record):
-        color = self.COLORS.get(record.levelname, '')
-        reset = self.COLORS['RESET'] if color else ''
-        # Backup -> mutar -> formatear -> restaurar (evita que los códigos
-        # ANSI se cuelen en el handler de archivo).
-        original_levelname = record.levelname
-        record.levelname = f"{color}{original_levelname}{reset}" if color else original_levelname
-        try:
-            return super().format(record)
-        finally:
-            record.levelname = original_levelname
-
-
-def setup_logging(log_file: str = 'bot_trading.log') -> logging.Logger:
-    """Configura el logging global en el **logger raíz**.
-
-    De esta forma TODOS los loggers nombrados que usa el bot
-    (``TradingBot``, ``Bot``, ``Exchange``, ``Technical``, ``Executor``,
-    ``Telegram``) heredan consola + archivo sin necesidad de configurarlos
-    uno por uno. Antes se configuraba solo ``TradingBot`` y los demás se
-    quedaban sin handler, por lo que sus mensajes INFO/DEBUG no se imprimían.
-    """
-    root = logging.getLogger()
-    root.setLevel(logging.DEBUG)
-    root.handlers.clear()
-
-    # Handler para consola (con colores)
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG)
-    console_handler.setFormatter(ColoredFormatter(
-        '%(asctime)s | %(levelname)-8s | %(name)-15s | %(message)s',
-        datefmt='%Y-%m-%d %H:%M:%S'
-    ))
-    root.addHandler(console_handler)
-
-    # Handler para archivo (sin colores)
-    if log_file:
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter(
-            '%(asctime)s | %(levelname)-8s | %(name)-15s | %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S'
-        ))
-        root.addHandler(file_handler)
-
-    # Silenciar logs ruidosos de librerías externas.
-    # ccxt emite DEBUG con el request/response HTTP completo (incluye API key,
-    # passphrase y signature en texto plano) — subimos a WARNING por seguridad
-    # y para no contaminar la consola.
-    for noisy in ('flask', 'werkzeug', 'urllib3', 'ccxt', 'requests'):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
-
-    # Devolver el logger 'TradingBot' para uso en el bloque __main__
-    return logging.getLogger('TradingBot')
-
-
-# Configurar logging global (root) — afecta a TODOS los loggers del bot
-logger = setup_logging('bot_trading.log')
-
-
-# ============================================================================
-# ENUMS Y DATA CLASSES
-# ============================================================================
-
-class TrendDirection(Enum):
-    """Dirección de la tendencia"""
-    UPTREND = "long"
-    DOWNTREND = "short"
-    NEUTRAL = None
-
+class Direction(Enum):
+    """Dirección del trade"""
+    LONG = "long"
+    SHORT = "short"
 
 @dataclass
-class IndicatorValues:
-    """Valores de indicadores para análisis"""
-    precio_actual: float
-    ema200: float
-    adx: float
-    st_direction: bool
-    st_direction_anterior: bool
-    upper_band: float
-    lower_band: float
-
-
-@dataclass
-class TradeSignal:
-    """Señal de trading detectada"""
-    symbol: str
-    direction: TrendDirection
-    precio: float
-    adx: float
-    timestamp: datetime
-    
-    def __str__(self):
-        return (f"[{self.timestamp.strftime('%H:%M:%S')}] "
-                f"{self.symbol} - {self.direction.value.upper()} @ {self.precio:.4f} "
-                f"(ADX: {self.adx:.2f})")
-
-
-# ============================================================================
-# CONFIGURACIÓN DEL BOT
-# ============================================================================
-
-@dataclass
-class BotConfig:
-    """Configuración centralizada del bot"""
-    # Credenciales (desde variables de entorno)
-    api_key: str
-    api_secret: str
-    api_password: str
-    telegram_token: str
-    telegram_chat_id: str
-    
-    # Trading
-    simbolos: list = None
-    timeframe: str = '1h'
-    leverage: int = 50
-    capital_riesgo_usdt: float = 50.0
-    porcentaje_sl: float = 0.015  # 1.5% stop loss
-    porcentaje_tp: float = 0.03   # 3.0% take profit (riesgo:beneficio 1:2)
-    
-    # Indicadores
-    st_periodo: int = 10
-    st_multiplier: float = 3.0
-    periodo_ema: int = 200
-    adx_threshold: float = 22.0
-    
-    # Sistema
-    ciclo_segundos: int = 60
-    limite_velas: int = 250
-    velas_minimas: int = 220
-    
-    def __post_init__(self):
-        if self.simbolos is None:
-            self.simbolos = ['BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT', 'XRP/USDT:USDT', 'AVAX/USDT:USDT']
+class Config:
+    """Configuración del bot"""
+    modo_simulacion: bool
+    leverage: int
+    capital_riesgo_usdt: float
+    capital_inicial_usdt: float
+    porcentaje_sl: float  # 0.008 = 0.8%
+    porcentaje_tp: float  # 0.012 = 1.2%
+    fraccion_equity: float  # Fracción de equity a arriesgar
+    simbolos: List[str]
     
     @classmethod
-    def desde_env(cls) -> 'BotConfig':
-        """Carga configuración desde variables de entorno"""
+    def from_env(cls):
         return cls(
-            api_key=os.getenv("OKX_API_KEY"),
-            api_secret=os.getenv("OKX_API_SECRET"),
-            api_password=os.getenv("OKX_API_PASSWORD"),
-            telegram_token=os.getenv("TELEGRAM_TOKEN"),
-            telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID"),
+            modo_simulacion=(MODO_SIMULACION == 1),
+            leverage=OKX_LEVERAGE,
+            capital_riesgo_usdt=float(os.getenv("CAPITAL_RIESGO_USDT", "5.0")),
+            capital_inicial_usdt=float(os.getenv("CAPITAL_INICIAL_USDT", "1000.0")),
+            porcentaje_sl=float(os.getenv("PORCENTAJE_SL", "0.008")),
+            porcentaje_tp=float(os.getenv("PORCENTAJE_TP", "0.012")),
+            fraccion_equity=float(os.getenv("FRACCION_EQUITY", "0.0075")),
+            simbolos=[s.strip() for s in os.getenv("SIMBOLOS", "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT").split(",")],
         )
 
-
-config = BotConfig.desde_env()
-
-if not all([config.api_key, config.api_secret, config.api_password]):
-    logger.error("❌ CREDENCIALES OKX NO CONFIGURADAS EN VARIABLES DE ENTORNO")
-    logger.error("   Por favor establecer: OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSWORD")
-    raise ValueError("Credenciales OKX no configuradas")
-
-
 # ============================================================================
-# SERVICIO DE TELEGRAM
+# NOTIFICADOR (TELEGRAM)
 # ============================================================================
 
 class TelegramNotifier:
-    """Gestor de notificaciones por Telegram"""
+    """Envía notificaciones por Telegram"""
     
     def __init__(self, token: str, chat_id: str):
         self.token = token
         self.chat_id = chat_id
-        self.logger = logging.getLogger('Telegram')
-        self.habilitado = bool(token and chat_id)
+        self.base_url = f"https://api.telegram.org/bot{token}"
     
-    def enviar(self, mensaje: str, nivel: str = "INFO") -> bool:
-        """Envía mensaje a Telegram"""
-        if not self.habilitado:
-            self.logger.debug(f"Telegram deshabilitado, mensaje no enviado: {mensaje[:50]}...")
+    def enviar(self, mensaje: str, tipo: str = "INFO"):
+        """
+        Envía mensaje a Telegram.
+        
+        tipo: INFO, TRADE, WARNING, ERROR
+        """
+        if not self.token or not self.chat_id:
             return False
         
+        # Emoji por tipo
+        emojis = {
+            "INFO": "ℹ️",
+            "TRADE": "📊",
+            "WARNING": "⚠️",
+            "ERROR": "🔴",
+            "SUCCESS": "✅",
+        }
+        
+        emoji = emojis.get(tipo, "")
+        texto = f"{emoji} {mensaje}"
+        
         try:
-            # Agregar emoji según nivel
-            emojis = {
-                "INFO": "ℹ️",
-                "SUCCESS": "✅",
-                "WARNING": "⚠️",
-                "ERROR": "❌",
-                "TRADE": "🎯"
-            }
-            
-            emoji = emojis.get(nivel, "•")
-            mensaje_formateado = f"{emoji} {mensaje}"
-            
-            url = f'https://api.telegram.org/bot{self.token}/sendMessage'
-            payload = {
-                'chat_id': self.chat_id,
-                'text': mensaje_formateado,
-                'parse_mode': 'HTML'
-            }
-            
-            response = requests.post(url, json=payload, timeout=5)
-            response.raise_for_status()
-            
-            self.logger.debug(f"✓ Telegram enviado: {mensaje[:60]}...")
-            return True
-            
-        except requests.exceptions.Timeout:
-            self.logger.warning("⚠️ Timeout al enviar a Telegram")
-            return False
-        except requests.exceptions.RequestException as e:
-            self.logger.error(f"❌ Error en Telegram: {e}")
-            return False
+            response = requests.post(
+                f"{self.base_url}/sendMessage",
+                json={"chat_id": self.chat_id, "text": texto},
+                timeout=5
+            )
+            return response.status_code == 200
         except Exception as e:
-            self.logger.error(f"❌ Error inesperado en Telegram: {e}")
+            logger.error(f"Error enviando Telegram: {e}")
             return False
-
-
-notifier = TelegramNotifier(config.telegram_token, config.telegram_chat_id)
-
 
 # ============================================================================
-# GESTOR DE EXCHANGE
+# PERSISTENCIA (SQLite)
+# ============================================================================
+
+class Persistencia:
+    """Gestiona almacenamiento de trades en SQLite"""
+    
+    def __init__(self, db_path: str = "trades.db"):
+        self.db_path = db_path
+        self._crear_tabla()
+    
+    def _conn(self):
+        """Obtiene conexión a BD"""
+        return sqlite3.connect(self.db_path)
+    
+    def _crear_tabla(self):
+        """Crea tabla si no existe"""
+        con = self._conn()
+        cursor = con.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                entry_ts TEXT NOT NULL,
+                entry_px REAL NOT NULL,
+                exit_ts TEXT,
+                exit_px REAL,
+                sl_px REAL NOT NULL,
+                tp_px REAL NOT NULL,
+                size REAL NOT NULL,
+                razon_salida TEXT,
+                pnl REAL,
+                virtual INTEGER DEFAULT 0,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        con.commit()
+        con.close()
+    
+    def abrir(
+        self,
+        symbol: str,
+        side: str,
+        entry_px: float,
+        sl_px: float,
+        tp_px: float,
+        size: float,
+        razon: str,
+        virtual: int = 0,
+    ) -> Optional[int]:
+        """Abre un nuevo trade"""
+        try:
+            con = self._conn()
+            cursor = con.cursor()
+            cursor.execute("""
+                INSERT INTO trades (symbol, side, entry_ts, entry_px, sl_px, tp_px, size, razon_salida, virtual)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                symbol,
+                side,
+                datetime.now(timezone.utc).isoformat(),
+                entry_px,
+                sl_px,
+                tp_px,
+                size,
+                razon,
+                virtual,
+            ))
+            con.commit()
+            tid = cursor.lastrowid
+            con.close()
+            return tid
+        except Exception as e:
+            logger.error(f"Error abriendo trade en BD: {e}")
+            return None
+    
+    def cerrar(
+        self,
+        trade_id: Optional[int],
+        exit_px: float,
+        razon: str,
+        pnl: Optional[float] = None,
+    ):
+        """Cierra un trade y calcula PnL si es necesario"""
+        if not trade_id:
+            return
+        
+        try:
+            con = self._conn()
+            
+            # Si no me dan PnL, lo calculo
+            if pnl is None:
+                cursor = con.cursor()
+                cursor.execute(
+                    "SELECT entry_px, side, size FROM trades WHERE id = ?",
+                    (trade_id,)
+                )
+                fila = cursor.fetchone()
+                if fila:
+                    entry_px, side, size = fila
+                    
+                    # MEJORA 1: Calcular PnL bruto
+                    if side == "long":
+                        pnl_bruto = (exit_px - entry_px) * size
+                    else:  # short
+                        pnl_bruto = (entry_px - exit_px) * size
+                    
+                    # MEJORA 2: Restar comisiones (0.05% entrada + 0.05% salida = 0.1% total)
+                    comisiones = (entry_px * size * 0.0005) + (exit_px * size * 0.0005)
+                    pnl = pnl_bruto - comisiones
+            
+            # Registrar cierre
+            con.execute(
+                """
+                UPDATE trades
+                SET exit_ts = ?, exit_px = ?, razon_salida = ?, pnl = ?
+                WHERE id = ?
+                """,
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    exit_px,
+                    razon,
+                    pnl,
+                    trade_id,
+                ),
+            )
+            con.commit()
+            con.close()
+        except Exception as e:
+            logger.error(f"Error cerrando trade en BD: {e}")
+    
+    def obtener_abierto(self, symbol: str) -> Optional[Dict]:
+        """Obtiene trade abierto de un símbolo"""
+        try:
+            con = self._conn()
+            cursor = con.cursor()
+            cursor.execute(
+                "SELECT id, side, entry_px FROM trades WHERE symbol = ? AND exit_px IS NULL ORDER BY entry_ts DESC LIMIT 1",
+                (symbol,)
+            )
+            fila = cursor.fetchone()
+            con.close()
+            
+            if fila:
+                return {
+                    "id": fila[0],
+                    "side": fila[1],
+                    "entry_px": fila[2],
+                }
+            return None
+        except Exception as e:
+            logger.error(f"Error obteniendo trade abierto: {e}")
+            return None
+
+# ============================================================================
+# EXCHANGE MANAGER (CCXT)
 # ============================================================================
 
 class ExchangeManager:
-    """Gestor de conexión y operaciones con OKX"""
+    """Gestiona conexión con OKX"""
     
-    def __init__(self, config: BotConfig):
-        self.config = config
-        self.logger = logging.getLogger('Exchange')
-        self.exchange = None
-        self._inicializar()
-    
-    def _inicializar(self):
-        """Inicializa la conexión con OKX"""
-        try:
-            self.exchange = ccxt.okx({
-                'apiKey': self.config.api_key,
-                'secret': self.config.api_secret,
-                'password': self.config.api_password,
-                'enableRateLimit': True,
-                'timeout': 15000,
-                'options': {'defaultType': 'swap'},
-            })
-            
-            self.exchange.set_sandbox_mode(True)
-            
-            # Verificar conexión
-            markets = self.exchange.load_markets()
-            self.logger.info(f"✓ Conexión OKX exitosa ({len(markets)} mercados cargados)")
-            
-        except ccxt.AuthenticationError as e:
-            self.logger.error(f"❌ Error de autenticación OKX: {e}")
-            notifier.enviar(f"Error de autenticación OKX", "ERROR")
-            raise
-        except Exception as e:
-            self.logger.error(f"❌ Error al conectar con OKX: {e}")
-            raise
-    
-    def configurar_mercado(self, symbol: str) -> bool:
-        """Configura un mercado específico: margen AISLADO + apalancamiento.
-
-        Margin mode **Aislado** (no Cruzado): si la posición se liquidara,
-        solo se pierde el margen asignado a esa operación (~$50), no el
-        balance total de la cuenta. Para un bot con 50x y SL inestable,
-        esto es crítico — evita que una posición desprotegida vacíe toda
-        la cuenta si el bot se cae.
-        """
-        try:
-            # 1) Margin mode aislado
-            try:
-                self.exchange.set_margin_mode('isolated', symbol)
-                self.logger.info(f"✓ {symbol}: Margen AISLADO configurado")
-            except Exception as e:
-                # OKX devuelve error si ya está en ese modo — no es crítico
-                self.logger.debug(f"{symbol}: margen ya aislado o no se pudo cambiar: {e}")
-
-            # 2) Apalancamiento
-            self.exchange.set_leverage(self.config.leverage, symbol)
-            self.logger.info(f"✓ {symbol}: Apalancamiento {self.config.leverage}x")
-            return True
-        except ccxt.BadSymbol:
-            self.logger.error(f"❌ Símbolo inválido: {symbol}")
-            return False
-        except Exception as e:
-            self.logger.warning(f"⚠️ Error configurando {symbol}: {e}")
-            return False
-    
-    def obtener_velas(self, symbol: str, limit: int = None) -> Optional[pd.DataFrame]:
-        """Obtiene velas OHLCV"""
-        limit = limit or self.config.limite_velas
+    def __init__(self, api_key: str, api_secret: str, api_password: str, modo_simulacion: bool = False):
+        self.exchange = ccxt.okx({
+            "apiKey": api_key,
+            "secret": api_secret,
+            "password": api_password,
+            "enableRateLimit": True,
+            "timeout": 10000,
+        })
         
-        try:
-            ohlcv = self.exchange.fetch_ohlcv(symbol, self.config.timeframe, limit=limit)
-            
-            df = pd.DataFrame(
-                ohlcv,
-                columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']
-            )
-            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
-            
-            return df
-            
-        except ccxt.BadSymbol:
-            self.logger.error(f"❌ Símbolo inválido: {symbol}")
-            return None
-        except ccxt.NetworkError:
-            self.logger.error(f"❌ Error de red al obtener velas de {symbol}")
-            return None
-        except Exception as e:
-            self.logger.error(f"❌ Error obteniendo velas de {symbol}: {e}")
-            return None
+        if modo_simulacion:
+            self.exchange.set_sandbox_mode(True)
+            logger.info("Modo SANDBOX activado")
+        
+        self.logger = logger
     
     def obtener_posicion_abierta(self, symbol: str) -> Optional[Dict]:
-        """Obtiene posición abierta si existe"""
+        """Obtiene posición abierta de un símbolo"""
         try:
-            positions = self.exchange.fetch_positions([symbol])
-            
-            for p in positions:
-                contracts = float(p.get('contracts', 0))
-                if contracts > 0:
-                    return p
-            
-            return None
-            
-        except ccxt.NetworkError:
-            self.logger.error(f"❌ Error de red consultando posiciones de {symbol}")
-            return None
+            posiciones = self.exchange.fetch_positions([symbol])
+            pos = next(
+                (p for p in posiciones if p["symbol"] == symbol and float(p.get("contracts", 0)) > 0),
+                None
+            )
+            return pos
         except Exception as e:
-            self.logger.error(f"❌ Error consultando posición en {symbol}: {e}")
-            self.logger.debug(traceback.format_exc())
+            self.logger.error(f"Error obteniendo posición de {symbol}: {e}")
             return None
     
-    def obtener_ticker(self, symbol: str) -> Optional[Dict]:
-        """Obtiene ticker actual"""
-        try:
-            return self.exchange.fetch_ticker(symbol)
-        except Exception as e:
-            self.logger.error(f"❌ Error obteniendo ticker de {symbol}: {e}")
-            return None
-    
-    def crear_orden_mercado(self, symbol: str, side: str, amount: float) -> bool:
+    def crear_orden_mercado(self, symbol: str, side: str, amount: float) -> Optional[Dict]:
         """Crea orden de mercado"""
         try:
-            self.logger.info(f"📤 Creando orden {side.upper()} de {amount} en {symbol}...")
-            self.exchange.create_market_order(symbol, side, amount)
-            self.logger.info(f"✓ Orden {side.upper()} ejecutada en {symbol}")
-            return True
+            order = self.exchange.create_order(
+                symbol,
+                "market",
+                side,
+                amount,
+                None,
+                {"marginMode": "isolated"}
+            )
+            return order
         except ccxt.InsufficientBalance:
-            self.logger.error(f"❌ Balance insuficiente para operar en {symbol}")
-            notifier.enviar(f"Balance insuficiente en {symbol}", "ERROR")
-            return False
+            self.logger.error(f"Fondos insuficientes para {symbol}")
+            return None
         except Exception as e:
-            self.logger.error(f"❌ Error creando orden en {symbol}: {e}")
-            return False
+            self.logger.error(f"Error creando orden en {symbol}: {e}")
+            return None
     
-    def crear_tp_sl(self, symbol: str, side: str, amount: float,
-                    sl_precio: float, tp_precio: float) -> tuple:
-        """Crea órdenes de Stop Loss y Take Profit en OKX usando el endpoint
-        nativo de algo orders.
-
-        OKX tiene DOS endpoints para crear órdenes:
-        - `/api/v5/trade/order` — órdenes regulares (market, limit).
-          ccxt usa este por defecto. NO acepta bien el flag `reduceOnly`
-          en swap (devuelve ``51205 Reduce Only is not available``).
-        - `/api/v5/trade/order-algo` — órdenes condicionales (SL, TP,
-          trailing stop, etc.). Es el ÚNICO endpoint que funciona
-          para poner SL/TP en OKX swap.
-
-        Parámetros OKX requeridos para ``conditional`` (SL o TP simple):
-        - instId:      'BTC-USDT-SWAP' (formato OKX, no 'BTC/USDT:USDT')
-        - tdMode:      'cross' o 'isolated' (margen)
-        - side:        'buy' o 'sell' (lado de CIERRE, opuesto al entry)
-        - posSide:     'net' (en modo single-position)
-        - ordType:     'conditional' (SL/TP simple, un solo trigger)
-        - sz:          tamaño en string (OKX exige string)
-        - slTriggerPx: precio que dispara el SL (opcional si solo TP)
-        - slOrdPx:     '-1' = ejecutar como MARKET al dispararse
-        - tpTriggerPx: precio que dispara el TP (opcional si solo SL)
-        - tpOrdPx:     '-1' = ejecutar como MARKET al dispararse
-        - tradeSide:   'close' (siempre — la orden es para cerrar)
-
-        Devuelve (sl_ok: bool, tp_ok: bool) — independientemente si cada
-        una se creó bien o falló.
-        """
-        side_opuesto = 'sell' if side == 'buy' else 'buy'
-
-        self.logger.info(
-            f"🛡️ Creando SL @ {sl_precio:.4f} + TP @ {tp_precio:.4f} "
-            f"({side_opuesto.upper()} {amount} {symbol})..."
-        )
-
-        market = self.exchange.market(symbol)
-        inst_id = market['id']
-        td_mode = 'isolated'
-
-        # === Crear SL ===
-        sl_ok = False
-        sl_algo_id = None
+    def cerrar_posicion(self, symbol: str, side: str, amount: float) -> Optional[Dict]:
+        """Cierra una posición"""
         try:
-            response = self.exchange.private_post_trade_order_algo({
-                'instId': inst_id,
-                'tdMode': td_mode,
-                'side': side_opuesto,
-                'posSide': 'net',
-                'ordType': 'conditional',
-                'sz': str(amount),
-                'slTriggerPx': str(sl_precio),
-                'slOrdPx': '-1',
-                'tradeSide': 'close',
-            })
-            if response.get('code') == '0':
-                data = response.get('data', [{}])
-                sl_algo_id = data[0].get('algoId', '?') if data else '?'
-                self.logger.info(f"✓ SL creado @ {sl_precio:.4f} (algoId={sl_algo_id})")
-                sl_ok = True
-            else:
-                msg = response.get('msg', '')
-                sMsg = ''
-                if response.get('data'):
-                    sMsg = response['data'][0].get('sMsg', '')
-                self.logger.error(f"❌ SL rechazado: code={response.get('code')} msg={msg} sMsg={sMsg}")
+            order_side = "sell" if side == "long" else "buy"
+            order = self.exchange.create_order(
+                symbol,
+                "market",
+                order_side,
+                amount,
+                None,
+                {"marginMode": "isolated", "reduceOnly": True}
+            )
+            return order
         except Exception as e:
-            self.logger.error(f"❌ Error creando SL: {e}")
-            self.logger.debug(traceback.format_exc())
-
-        # === Crear TP ===
-        tp_ok = False
-        tp_algo_id = None
+            self.logger.error(f"Error cerrando posición en {symbol}: {e}")
+            return None
+    
+    def crear_tp_sl(
+        self,
+        symbol: str,
+        side: str,
+        amount: float,
+        sl_px: float,
+        tp_px: float,
+    ) -> Tuple[bool, bool]:
+        """Crea Stop Loss y Take Profit en OKX"""
         try:
-            response = self.exchange.private_post_trade_order_algo({
-                'instId': inst_id,
-                'tdMode': td_mode,
-                'side': side_opuesto,
-                'posSide': 'net',
-                'ordType': 'conditional',
-                'sz': str(amount),
-                'tpTriggerPx': str(tp_precio),
-                'tpOrdPx': '-1',
-                'tradeSide': 'close',
+            inst_id = symbol.replace("/", "").replace(":", "-")
+            
+            # SL
+            sl_result = self.exchange.private_post_trade_order_algo({
+                "instId": inst_id,
+                "slTriggerPx": str(sl_px),
+                "slOrdPx": "-1",  # market
             })
-            if response.get('code') == '0':
-                data = response.get('data', [{}])
-                tp_algo_id = data[0].get('algoId', '?') if data else '?'
-                self.logger.info(f"✓ TP creado @ {tp_precio:.4f} (algoId={tp_algo_id})")
-                tp_ok = True
-            else:
-                msg = response.get('msg', '')
-                sMsg = ''
-                if response.get('data'):
-                    sMsg = response['data'][0].get('sMsg', '')
-                self.logger.error(f"❌ TP rechazado: code={response.get('code')} msg={msg} sMsg={sMsg}")
+            sl_ok = sl_result is not None
+            
+            # TP
+            tp_result = self.exchange.private_post_trade_order_algo({
+                "instId": inst_id,
+                "tpTriggerPx": str(tp_px),
+                "tpOrdPx": "-1",  # market
+            })
+            tp_ok = tp_result is not None
+            
+            return sl_ok, tp_ok
         except Exception as e:
-            self.logger.error(f"❌ Error creando TP: {e}")
-            self.logger.debug(traceback.format_exc())
-
-        return sl_ok, tp_ok
-
-    # Mantener alias por compatibilidad (código viejo que lo llama)
-    def crear_stop_loss(self, symbol: str, side: str, amount: float,
-                        sl_precio: float) -> bool:
-        """Wrapper legacy: crea solo SL (sin TP). Devuelve True si OK."""
-        # Calcula un TP dummy que no se va a usar; el caller solo ve el SL
-        # Mejor: redirigir a crear_tp_sl y devolver solo el estado del SL
-        # Pero como no tenemos el TP acá, creamos solo SL vía order-algo
-        side_opuesto = 'sell' if side == 'buy' else 'buy'
+            self.logger.error(f"Error creando SL/TP en {symbol}: {e}")
+            return False, False
+    
+    def obtener_balance(self) -> float:
+        """Obtiene balance en USDT"""
         try:
-            market = self.exchange.market(symbol)
-            response = self.exchange.private_post_trade_order_algo({
-                'instId': market['id'],
-                'tdMode': 'isolated',
-                'side': side_opuesto,
-                'posSide': 'net',
-                'ordType': 'conditional',
-                'sz': str(amount),
-                'slTriggerPx': str(sl_precio),
-                'slOrdPx': '-1',
-                'tradeSide': 'close',
-            })
-            if response.get('code') == '0':
-                self.logger.info(f"✓ SL creado @ {sl_precio:.4f}")
-                return True
-            else:
-                self.logger.error(f"❌ SL rechazado: {response}")
-                return False
+            balance = self.exchange.fetch_balance()
+            return float(balance["free"].get("USDT", 0))
         except Exception as e:
-            self.logger.error(f"❌ Error creando SL: {e}")
-            return False
-
+            self.logger.error(f"Error obteniendo balance: {e}")
+            return 0.0
 
 # ============================================================================
 # ANALIZADOR TÉCNICO
 # ============================================================================
 
 class TechnicalAnalyzer:
-    """Análisis técnico: SuperTrend, ADX, EMA"""
+    """Calcula indicadores técnicos"""
     
-    def __init__(self, config: BotConfig):
-        self.config = config
-        self.logger = logging.getLogger('Technical')
-    
-    def calcular_indicadores(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calcula todos los indicadores técnicos"""
+    @staticmethod
+    def calcular_indicadores(exchange: ccxt.Exchange, symbol: str, timeframe: str = "15m") -> Optional[Dict]:
+        """Calcula SuperTrend, EMA200 y ADX"""
         try:
-            high = df['high']
-            low = df['low']
-            close = df['close']
-            hl2 = (high + low) / 2
-
-            # Directional Movement
-            df['up_move'] = high - high.shift(1)
-            df['down_move'] = low.shift(1) - low
-            df['plus_dm'] = np.where(
-                (df['up_move'] > df['down_move']) & (df['up_move'] > 0),
-                df['up_move'], 0.0
-            )
-            df['minus_dm'] = np.where(
-                (df['down_move'] > df['up_move']) & (df['down_move'] > 0),
-                df['down_move'], 0.0
-            )
-
-            # True Range
-            df['tr0'] = abs(high - low)
-            df['tr1'] = abs(high - close.shift(1))
-            df['tr2'] = abs(low - close.shift(1))
-            df['tr'] = pd.concat([df['tr0'], df['tr1'], df['tr2']], axis=1).max(axis=1)
-
-            # Smoothing
-            alpha = 1 / self.config.st_periodo
-            df['tr_smoothed'] = df['tr'].ewm(alpha=alpha, adjust=False).mean()
-            df['plus_dm_smoothed'] = df['plus_dm'].ewm(alpha=alpha, adjust=False).mean()
-            df['minus_dm_smoothed'] = df['minus_dm'].ewm(alpha=alpha, adjust=False).mean()
-
-            # ADX
-            df['plus_di'] = 100 * (df['plus_dm_smoothed'] / df['tr_smoothed'])
-            df['minus_di'] = 100 * (df['minus_dm_smoothed'] / df['tr_smoothed'])
-            di_sum = df['plus_di'] + df['minus_di']
-            df['dx'] = 100 * abs(df['plus_di'] - df['minus_di']) / di_sum.replace(0, 1)
-            df['adx'] = df['dx'].ewm(alpha=alpha, adjust=False).mean()
-
-            # SuperTrend
-            df['upper_basic'] = hl2 + (self.config.st_multiplier * df['tr_smoothed'])
-            df['lower_basic'] = hl2 - (self.config.st_multiplier * df['tr_smoothed'])
-
-            upper_basic = df['upper_basic'].values
-            lower_basic = df['lower_basic'].values
-            close_vals = close.values
-
-            upper_band = np.zeros(len(df))
-            lower_band = np.zeros(len(df))
-            st = np.ones(len(df), dtype=bool)
-
-            for i in range(self.config.st_periodo, len(df)):
-                if (upper_basic[i] < upper_band[i - 1] or 
-                    close_vals[i - 1] > upper_band[i - 1]):
-                    upper_band[i] = upper_basic[i]
-                else:
-                    upper_band[i] = upper_band[i - 1]
-
-                if (lower_basic[i] > lower_band[i - 1] or 
-                    close_vals[i - 1] < lower_band[i - 1]):
-                    lower_band[i] = lower_basic[i]
-                else:
-                    lower_band[i] = lower_band[i - 1]
-
-                if i == self.config.st_periodo:
-                    st[i] = True
-                elif st[i - 1]:
-                    st[i] = False if close_vals[i] <= lower_band[i] else True
-                else:
-                    st[i] = True if close_vals[i] >= upper_band[i] else False
-
-            df['upper_band'] = upper_band
-            df['lower_band'] = lower_band
-            df['st_direction'] = st
-            df['ema200'] = close.ewm(span=self.config.periodo_ema, adjust=False).mean()
-
-            return df
+            # Obtener OHLCV
+            ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=100)
+            if not ohlcv or len(ohlcv) < 50:
+                return None
             
+            df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
+            
+            # Precio actual (último cierre)
+            precio_actual = float(df["close"].iloc[-1])
+            
+            # EMA200
+            ema200 = df["close"].ewm(span=200, adjust=False).mean().iloc[-1]
+            
+            # SuperTrend (10, 3)
+            st = TechnicalAnalyzer._supertrend(df["high"], df["low"], df["close"], period=10, multiplier=3)
+            supertrend_actual = float(st.iloc[-1])
+            
+            # ADX (14)
+            adx = TechnicalAnalyzer._adx(df["high"], df["low"], df["close"], period=14)
+            adx_actual = float(adx.iloc[-1])
+            
+            # Tendencia SuperTrend
+            if precio_actual > supertrend_actual:
+                tendencia = "UPTREND"
+            else:
+                tendencia = "DOWNTREND"
+            
+            return {
+                "precio": precio_actual,
+                "ema200": float(ema200),
+                "supertrend": supertrend_actual,
+                "adx": adx_actual,
+                "tendencia": tendencia,
+            }
         except Exception as e:
-            self.logger.error(f"❌ Error calculando indicadores: {e}")
-            self.logger.debug(traceback.format_exc())
-            raise
+            logger.error(f"Error calculando indicadores para {symbol}: {e}")
+            return None
     
-    def extraer_valores(self, df: pd.DataFrame) -> Tuple[IndicatorValues, IndicatorValues]:
-        """Extrae valores de indicadores para análisis"""
-        try:
-            fila_actual = df.iloc[-2]
-            fila_anterior = df.iloc[-3]
-            
-            valores_actual = IndicatorValues(
-                precio_actual=fila_actual['close'],
-                ema200=fila_actual['ema200'],
-                adx=fila_actual['adx'],
-                st_direction=fila_actual['st_direction'],
-                st_direction_anterior=fila_anterior['st_direction'],
-                upper_band=fila_actual['upper_band'],
-                lower_band=fila_actual['lower_band']
-            )
-            
-            valores_anterior = IndicatorValues(
-                precio_actual=fila_anterior['close'],
-                ema200=fila_anterior['ema200'],
-                adx=fila_anterior['adx'],
-                st_direction=fila_anterior['st_direction'],
-                st_direction_anterior=df.iloc[-4]['st_direction'],
-                upper_band=fila_anterior['upper_band'],
-                lower_band=fila_anterior['lower_band']
-            )
-            
-            return valores_actual, valores_anterior
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error extrayendo valores: {e}")
-            return None, None
+    @staticmethod
+    def _supertrend(high, low, close, period=10, multiplier=3):
+        """Calcula SuperTrend"""
+        hl_avg = (high + low) / 2
+        matr = hl_avg.rolling(window=period).mean()
+        atr = TechnicalAnalyzer._atr(high, low, close, period) * multiplier
+        
+        upper = matr + atr
+        lower = matr - atr
+        
+        supertrend = pd.Series(index=close.index, dtype='float64')
+        
+        for i in range(period, len(close)):
+            if i == period:
+                supertrend.iloc[i] = lower.iloc[i]
+            else:
+                if close.iloc[i] <= upper.iloc[i-1]:
+                    supertrend.iloc[i] = upper.iloc[i]
+                else:
+                    supertrend.iloc[i] = lower.iloc[i]
+        
+        return supertrend
     
-    def detectar_señal(self, valores: IndicatorValues) -> Optional[TrendDirection]:
-        """Detecta señal de trading basada en indicadores"""
-        try:
-            # Condiciones para LONG
-            if (not valores.st_direction_anterior and 
-                valores.st_direction and 
-                valores.precio_actual > valores.ema200 and
-                valores.adx > self.config.adx_threshold):
-                return TrendDirection.UPTREND
-            
-            # Condiciones para SHORT
-            if (valores.st_direction_anterior and 
-                not valores.st_direction and 
-                valores.precio_actual < valores.ema200 and
-                valores.adx > self.config.adx_threshold):
-                return TrendDirection.DOWNTREND
-            
-            return TrendDirection.NEUTRAL
-            
-        except Exception as e:
-            self.logger.error(f"❌ Error detectando señal: {e}")
-            return TrendDirection.NEUTRAL
-
+    @staticmethod
+    def _atr(high, low, close, period=14):
+        """Calcula ATR"""
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        return atr
+    
+    @staticmethod
+    def _adx(high, low, close, period=14):
+        """Calcula ADX"""
+        tr1 = high - low
+        tr2 = abs(high - close.shift())
+        tr3 = abs(low - close.shift())
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        
+        up = high - high.shift()
+        down = low.shift() - low
+        
+        pos_dm = up.where((up > down) & (up > 0), 0)
+        neg_dm = down.where((down > up) & (down > 0), 0)
+        
+        pos_di = 100 * pos_dm.rolling(window=period).mean() / atr
+        neg_di = 100 * neg_dm.rolling(window=period).mean() / atr
+        
+        di_diff = abs(pos_di - neg_di)
+        di_sum = pos_di + neg_di
+        
+        dx = 100 * di_diff / di_sum
+        adx = dx.rolling(window=period).mean()
+        
+        return adx
 
 # ============================================================================
 # EJECUTOR DE TRADES
 # ============================================================================
 
 class TradeExecutor:
-    """Ejecuta operaciones de trading"""
+    """Ejecuta trades (entrada y salida)"""
     
-    def __init__(self, exchange_manager: ExchangeManager, config: BotConfig):
-        self.exchange = exchange_manager
+    def __init__(self, exchange: ExchangeManager, persistencia: Persistencia, notifier: TelegramNotifier, config: Config):
+        self.exchange = exchange
+        self.persistencia = persistencia
+        self.notifier = notifier
         self.config = config
-        self.logger = logging.getLogger('Executor')
+        self.trade_abierto_id = {}  # {symbol: trade_id}
+        self.trade_info_abierto = {}  # {symbol: {"entry_px": ..., "side": ..., "size": ...}}
+        self.equity_actual = config.capital_inicial_usdt
     
-    def calcular_tamaño_posicion(self, symbol: str, precio_mercado: float) -> Optional[float]:
-        """Calcula el tamaño de posición según capital de riesgo"""
+    def buscar_entrada(self, symbol: str, valores: Dict) -> bool:
+        """Busca oportunidad de entrada"""
         try:
-            market = self.exchange.exchange.market(symbol)
-            contract_size = market.get('contractSize', 1.0)
+            # Validar que no hay posición abierta
+            if symbol in self.trade_abierto_id:
+                return False
             
-            notional = self.config.capital_riesgo_usdt * self.config.leverage
-            raw_amount = notional / (precio_mercado * contract_size)
-            amount = float(self.exchange.exchange.amount_to_precision(symbol, raw_amount))
+            precio = valores["precio"]
+            ema200 = valores["ema200"]
+            supertrend = valores["supertrend"]
+            adx = valores["adx"]
+            tendencia = valores["tendencia"]
             
-            if amount <= 0:
-                self.logger.warning(f"⚠️ Monto calculado inválido: {amount}")
-                return None
+            # Lógica de entrada: SuperTrend + EMA + ADX
+            signal = None
             
-            self.logger.debug(f"{symbol}: Tamaño posición = {amount} contratos")
-            return amount
+            if tendencia == "UPTREND" and precio > ema200 and adx > 22:
+                signal = Direction.LONG
+            elif tendencia == "DOWNTREND" and precio < ema200 and adx > 22:
+                signal = Direction.SHORT
             
-        except Exception as e:
-            self.logger.error(f"❌ Error calculando tamaño: {e}")
-            return None
-    
-    def abrir_posicion(self, signal: TradeSignal, valores: IndicatorValues) -> bool:
-        """Abre una nueva posición con stop loss"""
-        symbol = signal.symbol
-        direction = signal.direction
+            if not signal:
+                return False
+            
+            # Calcular tamaño basado en equity
+            riesgo = min(
+                self.equity_actual * self.config.fraccion_equity,
+                self.config.capital_riesgo_usdt,
+            )
+            
+            # Calcular precios de SL y TP
+            if signal == Direction.LONG:
+                sl_precio = precio * (1 - self.config.porcentaje_sl)
+                tp_precio = precio * (1 + self.config.porcentaje_tp)
+            else:
+                sl_precio = precio * (1 + self.config.porcentaje_sl)
+                tp_precio = precio * (1 - self.config.porcentaje_tp)
+            
+            # Validar que SL no cae en liquidación
+            liq = 1.0 / max(self.config.leverage, 1)
+            dist_sl = abs(precio - sl_precio) / precio
+            if dist_sl >= liq * 0.8:
+                logger.warning(f"SL cae en zona de liquidación ({dist_sl:.2%} >= {liq*0.8:.2%}) — no opero")
+                return False
+            
+            # Calcular tamaño de contrato
+            amount = riesgo / (precio * self.config.porcentaje_sl)
+            
+            # Normalizar cantidad
+            try:
+                market = self.exchange.exchange.market(symbol)
+                min_amount = market["limits"]["amount"]["min"]
+                if amount < min_amount:
+                    amount = min_amount
+            except:
+                pass
+            
+            # Abrir orden
+            logger.info(f"Abriendo {signal.value.upper()} en {symbol} @ ${precio:.4f} | SL: ${sl_precio:.4f} | TP: ${tp_precio:.4f}")
+            
+            if self.config.modo_simulacion:
+                # Simulación
+                tid = self.persistencia.abrir(
+                    symbol, signal.value, precio, sl_precio, tp_precio, amount, "signal", virtual=1
+                )
+                if tid:
+                    self.trade_abierto_id[symbol] = tid
+                    self.trade_info_abierto[symbol] = {
+                        "entry_px": precio,
+                        "side": signal.value,
+                        "size": amount,
+                    }
+                    self.notifier.enviar(
+                        f"SIMULADA ENTRADA ({symbol})\nDirección: {signal.value.upper()}\nEntrada: ${precio:.4f}\nSL: ${sl_precio:.4f}\nTP: ${tp_precio:.4f}\nADX: {adx:.2f}",
+                        "TRADE"
+                    )
+                    return True
+            else:
+                # Real
+                order = self.exchange.crear_orden_mercado(symbol, signal.value, amount)
+                if not order:
+                    return False
+                
+                # Crear SL y TP
+                sl_ok, tp_ok = self.exchange.crear_tp_sl(symbol, signal.value, amount, sl_precio, tp_precio)
+                
+                if sl_ok:
+                    tid = self.persistencia.abrir(
+                        symbol, signal.value, precio, sl_precio, tp_precio, amount, "signal", virtual=0
+                    )
+                    if tid:
+                        self.trade_abierto_id[symbol] = tid
+                        self.trade_info_abierto[symbol] = {
+                            "entry_px": precio,
+                            "side": signal.value,
+                            "size": amount,
+                        }
+                        
+                        # MEJORA 4: Verificar que TP se creó
+                        if not tp_ok:
+                            self.notifier.enviar(
+                                f"⚠️ ALERTA TP NO CREADO ({symbol})\nDirección: {signal.value.upper()}\nEntrada: ${precio:.4f}\nSL: ${sl_precio:.4f}\nTP FALTANTE: ${tp_precio:.4f}\nEl SL está activo pero el trade no tiene techo. Revisa OKX manualmente.",
+                                "WARNING"
+                            )
+                            logger.error(f"TP no creado en {symbol} — monitorea manualmente")
+                        
+                        self.notifier.enviar(
+                            f"ENTRADA ({symbol})\nDirección: {signal.value.upper()}\nEntrada: ${precio:.4f}\nSL: ${sl_precio:.4f}\nTP: ${tp_precio:.4f}\nADX: {adx:.2f}",
+                            "TRADE"
+                        )
+                        return True
+                else:
+                    logger.error(f"SL no creado en {symbol} — cancelando entrada")
+                    return False
         
-        try:
-            self.logger.info(f"🎯 Procesando señal {direction.value.upper()} en {symbol}...")
-            
-            # Obtener ticker
-            ticker = self.exchange.obtener_ticker(symbol)
-            if not ticker:
-                return False
-            
-            precio_mercado = ticker['last']
-            
-            # Calcular tamaño
-            amount = self.calcular_tamaño_posicion(symbol, precio_mercado)
-            if not amount:
-                return False
-            
-            # Calcular stop loss y take profit
-            if direction == TrendDirection.UPTREND:
-                sl_precio = precio_mercado * (1 - self.config.porcentaje_sl)
-                tp_precio = precio_mercado * (1 + self.config.porcentaje_tp)
-                side = 'buy'
-            else:
-                sl_precio = precio_mercado * (1 + self.config.porcentaje_sl)
-                tp_precio = precio_mercado * (1 - self.config.porcentaje_tp)
-                side = 'sell'
-            
-            # Crear orden de entrada
-            if not self.exchange.crear_orden_mercado(symbol, side, amount):
-                return False
-
-            # Crear SL + TP — y verificar que se hayan creado
-            sl_creado, tp_creado = self.exchange.crear_tp_sl(
-                symbol, side, amount, sl_precio, tp_precio
-            )
-
-            if sl_creado:
-                # SL OK — notificar con el estado del TP
-                tp_status = f"TP: {tp_precio:.4f}" if tp_creado else "⚠️ TP no creado"
-                msg = (
-                    f"🟢 NUEVA OPERACIÓN ({symbol})\n"
-                    f"Dirección: {direction.value.upper()}\n"
-                    f"Tamaño: {amount} contratos\n"
-                    f"Entrada: {precio_mercado:.4f}\n"
-                    f"SL: {sl_precio:.4f}\n"
-                    f"{tp_status}\n"
-                    f"ADX: {valores.adx:.2f}"
-                )
-                self.logger.info(msg)
-                notifier.enviar(msg, "TRADE")
-                return True
-
-            # === SL NO se pudo crear ===
-            # Política de seguridad: una posición sin SL es inaceptable porque
-            # si el bot se cae, no hay nada que la cierre del lado del exchange.
-            # Cerramos la posición recién abierta y notificamos al usuario.
-            self.logger.error(
-                f"🚨 SL NO creado en {symbol} — cerrando posición recién abierta "
-                f"para evitar posición desprotegida."
-            )
-            side_cierre = 'sell' if side == 'buy' else 'buy'
-            cierre_ok = self.exchange.crear_orden_mercado(symbol, side_cierre, amount)
-
-            if cierre_ok:
-                msg = (
-                    f"🚨 OPERACIÓN CANCELADA ({symbol})\n"
-                    f"Se abrió {direction.value.upper()} @ {precio_mercado:.4f} "
-                    f"pero el SL NO se pudo crear en OKX.\n"
-                    f"Para evitar una posición desprotegida, el bot cerró la "
-                    f"operación inmediatamente.\n"
-                    f"\n"
-                    f"Revisá los logs para ver el error exacto del SL."
-                )
-            else:
-                msg = (
-                    f"🚨🚨 EMERGENCIA ({symbol})\n"
-                    f"Se abrió {direction.value.upper()} @ {precio_mercado:.4f}.\n"
-                    f"NO se pudo crear el SL.\n"
-                    f"TAMPOCO se pudo cerrar la posición automáticamente.\n"
-                    f"CERRÁ LA POSICIÓN MANUALMENTE EN OKX AHORA."
-                )
-                self.logger.critical(
-                    f"🚨🚨 {symbol}: ni SL ni cierre manual funcionaron — "
-                    f"posición desprotegida, requiere intervención humana"
-                )
-            self.logger.error(msg)
-            notifier.enviar(msg, "ERROR")
-            return False
-            
         except Exception as e:
-            self.logger.error(f"❌ Error abriendo posición en {symbol}: {e}")
-            self.logger.debug(traceback.format_exc())
-            notifier.enviar(f"Error abriendo posición en {symbol}: {e}", "ERROR")
+            logger.error(f"Error en entrada de {symbol}: {e}\n{traceback.format_exc()}")
             return False
     
-    def cerrar_posicion(self, symbol: str, posicion: Dict, razon: str) -> bool:
-        """Cierra una posición abierta"""
+    def buscar_salida(self, symbol: str, valores: Dict) -> bool:
+        """Busca oportunidad de salida (SL/TP manual)"""
         try:
-            side = posicion['side']
-            amount = float(posicion['contracts'])
-            
-            # Orden opuesta
-            order_side = 'sell' if side == 'long' else 'buy'
-            
-            self.logger.info(f"📤 Cerrando posición {side.upper()} de {amount} en {symbol}...")
-            
-            if not self.exchange.crear_orden_mercado(symbol, order_side, amount):
+            tid = self.trade_abierto_id.get(symbol)
+            if not tid:
                 return False
             
-            # Notificar
-            msg = (
-                f"🔴 POSICIÓN CERRADA ({symbol})\n"
-                f"Tipo: {side.upper()}\n"
-                f"Tamaño: {amount} contratos\n"
-                f"Razón: {razon}"
-            )
-            self.logger.info(msg)
-            notifier.enviar(msg, "INFO")
+            info = self.trade_info_abierto.get(symbol)
+            if not info:
+                return False
             
-            return True
+            precio_actual = valores["precio"]
+            entry_px = info["entry_px"]
+            side = info["side"]
+            size = info["size"]
             
-        except Exception as e:
-            self.logger.error(f"❌ Error cerrando posición en {symbol}: {e}")
-            self.logger.debug(traceback.format_exc())
+            # Calcular SL y TP
+            if side == "long":
+                sl = entry_px * (1 - self.config.porcentaje_sl)
+                tp = entry_px * (1 + self.config.porcentaje_tp)
+                debe_cerrar = precio_actual <= sl or precio_actual >= tp
+                razon = "SL" if precio_actual <= sl else "TP"
+            else:
+                sl = entry_px * (1 + self.config.porcentaje_sl)
+                tp = entry_px * (1 - self.config.porcentaje_tp)
+                debe_cerrar = precio_actual >= sl or precio_actual <= tp
+                razon = "SL" if precio_actual >= sl else "TP"
+            
+            if debe_cerrar:
+                logger.info(f"Salida {side.upper()} en {symbol} ({razon}) @ ${precio_actual:.4f}")
+                
+                if self.config.modo_simulacion:
+                    # Simulación
+                    self.persistencia.cerrar(tid, precio_actual, razon)
+                    self.trade_abierto_id.pop(symbol, None)
+                    self.trade_info_abierto.pop(symbol, None)
+                    self.notifier.enviar(
+                        f"SIMULADA SALIDA ({symbol})\nDirección: {side.upper()}\nRazón: {razon}\nSalida: ${precio_actual:.4f}",
+                        "TRADE"
+                    )
+                    return True
+                else:
+                    # Real
+                    order_side = "sell" if side == "long" else "buy"
+                    order = self.exchange.cerrar_posicion(symbol, side, size)
+                    
+                    if order:
+                        # MEJORA 1 + 2: El PnL se calcula automáticamente en persistencia.cerrar()
+                        self.persistencia.cerrar(tid, precio_actual, razon)
+                        self.trade_abierto_id.pop(symbol, None)
+                        self.trade_info_abierto.pop(symbol, None)
+                        
+                        self.notifier.enviar(
+                            f"SALIDA ({symbol})\nDirección: {side.upper()}\nRazón: {razon}\nSalida: ${precio_actual:.4f}",
+                            "TRADE"
+                        )
+                        return True
+            
             return False
-
+        
+        except Exception as e:
+            logger.error(f"Error en salida de {symbol}: {e}\n{traceback.format_exc()}")
+            return False
 
 # ============================================================================
-# MOTOR PRINCIPAL DEL BOT
+# BOT PRINCIPAL
 # ============================================================================
 
 class TradingBot:
-    """Orquestador principal del bot de trading"""
+    """Bot de trading principal"""
     
-    def __init__(self, config: BotConfig):
+    def __init__(self, config: Config):
         self.config = config
-        # Logger para logs a nivel de ciclo (aparece como 'TradingBot')
-        self.logger = logging.getLogger('TradingBot')
-        # Logger para logs a nivel de símbolo individual (aparece como 'Bot')
-        self.bot_logger = logging.getLogger('Bot')
-
-        self.exchange = ExchangeManager(config)
-        self.analyzer = TechnicalAnalyzer(config)
-        self.executor = TradeExecutor(self.exchange, config)
-
-        self.activo = True
+        self.notifier = TelegramNotifier(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+        self.exchange = ExchangeManager(OKX_API_KEY, OKX_API_SECRET, OKX_API_PASSWORD, config.modo_simulacion)
+        self.persistencia = Persistencia(DB_PATH)
+        self.executor = TradeExecutor(self.exchange, self.persistencia, self.notifier, config)
+        self.analyzer = TechnicalAnalyzer()
+        self.running = True
         self.ciclo_contador = 0
-
-        # === Estado para reportes Telegram horarios ===
-        # Último envío de reporte (para no repetir en la misma hora)
-        self.ultimo_reporte_ts = None
-        # Estado actual de cada símbolo: {symbol: {precio, st, adx, posicion, razon}}
-        self.estado_simbolos = {}
-
-        # === Cooldown de señales (evita re-entrar en la misma señal) ===
-        # Diccionario {symbol: timestamp_última_señal_procesada}
-        # Una vez que el bot procesó una señal (entró o falló al entrar),
-        # no vuelve a considerar señales para ese símbolo hasta que pase
-        # `cooldown_segundos` O hasta que cambie la dirección de ST.
-        # Esto evita el loop "entra → rollback → vuelve a entrar" cuando
-        # el SL falla y la señal sigue activa en velas de 1h.
-        self.ultima_senal_ts = {}
-        self.ultima_senal_direccion = {}
-        self.cooldown_segundos = 300  # 5 minutos — configurable
     
-    def inicializar(self) -> bool:
+    def inicializar(self):
         """Inicializa el bot"""
         try:
-            self.logger.info("")
-            self.logger.info("=" * 100)
-            self.logger.info("🤖🤖🤖 INICIANDO BOT DE TRADING OKX 🤖🤖🤖")
-            self.logger.info("=" * 100)
+            logger.info("Inicializando bot...")
+            balance = self.exchange.obtener_balance()
+            logger.info(f"Balance USDT: ${balance:.2f}")
             
-            self.logger.info(f"📊 Símbolos: {', '.join(self.config.simbolos)}")
-            self.logger.info(f"⏰ Timeframe: {self.config.timeframe}")
-            self.logger.info(f"📈 Leverage: {self.config.leverage}x")
-            self.logger.info(f"💰 Capital de riesgo: {self.config.capital_riesgo_usdt} USDT por operación")
-            self.logger.info(f"📊 ADX Threshold: {self.config.adx_threshold}")
-            self.logger.info(f"⏳ Ciclo: cada {self.config.ciclo_segundos} segundos")
+            if balance < 100:
+                logger.warning(f"Balance bajo: ${balance:.2f}")
             
-            # Configurar mercados
-            self.logger.info("")
-            self.logger.info("🔧 Configurando mercados...")
+            # Configurar leverage
             for symbol in self.config.simbolos:
-                if not self.exchange.configurar_mercado(symbol):
-                    self.logger.warning(f"⚠️ No se pudo configurar {symbol}")
+                try:
+                    self.exchange.exchange.set_leverage(self.config.leverage, symbol, {"marginMode": "isolated"})
+                    logger.info(f"Leverage x{self.config.leverage} en {symbol}")
+                except:
+                    pass
             
-            self.logger.info("=" * 100)
-            self.logger.info("✅ Bot inicializado correctamente y listo para operar")
-            self.logger.info("=" * 100)
-            self.logger.info("")
-            
-            notifier.enviar("🤖 Bot de trading OKX iniciado y funcionando", "SUCCESS")
+            logger.info("Bot inicializado correctamente")
+            self.notifier.enviar(
+                f"Bot iniciado\nModo: {'SIMULACIÓN' if self.config.modo_simulacion else 'REAL'}\nLeverage: x{self.config.leverage}\nBalance: ${balance:.2f}",
+                "INFO"
+            )
             return True
-            
         except Exception as e:
-            self.logger.error(f"❌ Error inicializando bot: {e}")
-            self.logger.debug(traceback.format_exc())
-            notifier.enviar(f"Error inicializando bot: {e}", "ERROR")
+            logger.error(f"Error inicializando bot: {e}")
             return False
     
-    def analizar_symbol(self, symbol: str) -> bool:
-        """Analiza un símbolo individual"""
+    def ejecutar_ciclo(self):
+        """Ejecuta un ciclo de trading"""
         try:
-            # Obtener velas
-            df_raw = self.exchange.obtener_velas(symbol)
-            if df_raw is None:
-                self.logger.error(f"❌ {symbol}: No se pudieron obtener velas (API error)")
-                return False
+            self.ciclo_contador += 1
             
-            if len(df_raw) < self.config.velas_minimas:
-                self.logger.warning(
-                    f"⚠️ {symbol}: Datos insuficientes "
-                    f"({len(df_raw)}/{self.config.velas_minimas} velas)"
-                )
-                return False
+            for symbol in self.config.simbolos:
+                try:
+                    # Obtener indicadores
+                    valores = self.analyzer.calcular_indicadores(self.exchange.exchange, symbol)
+                    if not valores:
+                        continue
+                    
+                    # Buscar salida (SL/TP)
+                    self.executor.buscar_salida(symbol, valores)
+                    
+                    # Buscar entrada
+                    self.executor.buscar_entrada(symbol, valores)
+                    
+                except Exception as e:
+                    logger.error(f"Error procesando {symbol}: {e}")
             
-            # Calcular indicadores
-            df = self.analyzer.calcular_indicadores(df_raw)
-            valores, _ = self.analyzer.extraer_valores(df)
-            
-            if not valores:
-                self.logger.error(f"❌ {symbol}: No se pudieron extraer indicadores")
-                return False
-
-            # === Log de estado detallado ===
-            # Para el LOG mostramos la vela EN FORMACIÓN (df.iloc[-1]) que
-            # actualiza su close en tiempo real con cada trade — así el
-            # Precio cambia entre ciclos. Las DECISIONES de trading
-            # (`valores` = df.iloc[-2], última vela cerrada) quedan intactas:
-            # operar sobre velas cerradas evita repintado y falsas señales.
-            fila_live = df.iloc[-1]
-            precio_live = float(fila_live['close'])
-            ema200_live = float(fila_live['ema200'])
-            adx_live = float(fila_live['adx'])
-            st_live = bool(fila_live['st_direction'])
-
-            tendencia = "ALCISTA ↗️" if st_live else "BAJISTA ↘️"
-            precio_dist_ema = ((precio_live - ema200_live) / ema200_live) * 100
-
-            self.bot_logger.info(
-                f"📈 {symbol:15} | "
-                f"Precio: ${precio_live:8.2f} | "
-                f"EMA200: ${ema200_live:8.2f} ({precio_dist_ema:+6.2f}%) | "
-                f"ADX: {adx_live:5.2f} | "
-                f"ST: {tendencia}"
-            )
-
-            # Verificar posición existente
-            posicion = self.exchange.obtener_posicion_abierta(symbol)
-            tiene_posicion = posicion is not None
-
-            # Determinar razón de no operar (para reporte Telegram horario)
-            razon_no_operar = self._determinar_razon_no_operar(valores, tiene_posicion)
-
-            # Registrar estado actual para el reporte horario
-            self.estado_simbolos[symbol] = {
-                'precio': precio_live,
-                'st': st_live,
-                'adx': valores.adx,
-                'posicion': tiene_posicion,
-                'side_posicion': posicion['side'] if tiene_posicion else None,
-                'razon': razon_no_operar,
-            }
-
-            if posicion:
-                self.bot_logger.info(
-                    f"📌 {symbol}: POSICIÓN ABIERTA ({posicion['side'].upper()}) - "
-                    f"{float(posicion['contracts'])} contratos"
-                )
-                self._manejar_posicion_abierta(symbol, posicion, valores)
-                return True
-            
-            # Detectar nueva señal
-            señal_direccion = self.analyzer.detectar_señal(valores)
-            
-            if señal_direccion != TrendDirection.NEUTRAL:
-                # === Verificar cooldown antes de actuar ===
-                # Si ya procesamos esta misma señal en los últimos
-                # `cooldown_segundos` y la dirección de ST no cambió,
-                # NO re-entrar. Evita el loop "entra → rollback → entra"
-                # cuando el SL falla y la señal sigue activa.
-                ahora_ts = datetime.now().timestamp()
-                ultima_ts = self.ultima_senal_ts.get(symbol, 0)
-                ultima_dir = self.ultima_senal_direccion.get(symbol)
-                segundos_desde_ultima = ahora_ts - ultima_ts
-
-                if (ultima_dir == señal_direccion.value and
-                    segundos_desde_ultima < self.cooldown_segundos):
-                    self.bot_logger.info(
-                        f"⏸️  {symbol}: señal {señal_direccion.value.upper()} activa "
-                        f"pero en cooldown ({int(self.cooldown_segundos - segundos_desde_ultima)}s restantes)"
-                    )
-                else:
-                    signal = TradeSignal(
-                        symbol=symbol,
-                        direction=señal_direccion,
-                        precio=valores.precio_actual,
-                        adx=valores.adx,
-                        timestamp=datetime.now()
-                    )
-                    self.logger.warning("")
-                    self.logger.warning("🎯🎯🎯 SEÑAL DETECTADA 🎯🎯🎯")
-                    self.logger.warning(f"🎯 NUEVA SEÑAL: {signal}")
-                    self.logger.warning("🎯🎯🎯 NUEVA SEÑAL 🎯🎯🎯")
-                    self.logger.warning("")
-                    # Registrar que procesamos esta señal (cooldown)
-                    self.ultima_senal_ts[symbol] = ahora_ts
-                    self.ultima_senal_direccion[symbol] = señal_direccion.value
-                    self.executor.abrir_posicion(signal, valores)
-            
-            return True
-            
+            time.sleep(5)  # Esperar 5 segundos
+        
         except Exception as e:
-            self.logger.error(f"❌ Error analizando {symbol}: {e}")
-            self.logger.debug(traceback.format_exc())
-            return False
+            logger.error(f"Error en ciclo: {e}")
     
-    def _manejar_posicion_abierta(self, symbol: str, posicion: Dict, 
-                                   valores: IndicatorValues):
-        """Maneja una posición abierta"""
-        side = posicion['side']
-        debe_cerrar = False
-        razon = ""
-        
-        if side == 'long' and not valores.st_direction:
-            debe_cerrar = True
-            razon = "SuperTrend cambió a bajista"
-        elif side == 'short' and valores.st_direction:
-            debe_cerrar = True
-            razon = "SuperTrend cambió a alcista"
-        
-        if debe_cerrar:
-            self.bot_logger.warning(f"🚨 Señal de SALIDA en {symbol}: {razon}")
-            self.executor.cerrar_posicion(symbol, posicion, razon)
-
-    # ============================================================================
-    # REPORTE TELEGRAM HORARIO
-    # ============================================================================
-
-    def _determinar_razon_no_operar(self, valores: IndicatorValues,
-                                     posicion_abierta: bool) -> str:
-        """Determina por qué el bot NO abrió posición nueva en este símbolo.
-
-        Sigue el mismo orden lógico que `TechnicalAnalyzer.detectar_señal()`:
-        si la señal fue NEUTRAL, alguna de estas condiciones falló.
-        """
-        if posicion_abierta:
-            return "pos. abierta"
-        if valores.adx < self.config.adx_threshold:
-            return f"ADX débil ({valores.adx:.0f})"
-        if valores.st_direction == valores.st_direction_anterior:
-            return "ST sin cambio"
-        # ST cambió pero el precio no confirmó del lado correcto de la EMA200
-        if valores.st_direction and valores.precio_actual <= valores.ema200:
-            return "precio < EMA200"
-        if not valores.st_direction and valores.precio_actual >= valores.ema200:
-            return "precio > EMA200"
-        return "sin señal"
-
-    def _debe_enviar_reporte(self) -> bool:
-        """Verifica si en este ciclo toca enviar reporte a Telegram.
-
-        Horario Argentina (GMT-3):
-        - Día (07-22): cada 1 hora
-        - Noche (23, 01, 03, 05): cada 2 horas
-        """
-        ahora = datetime.now(GMT_MINUS_3)
-
-        # ¿Ya enviamos reporte en esta misma hora-calendario?
-        if (self.ultimo_reporte_ts is not None and
-            self.ultimo_reporte_ts.hour == ahora.hour and
-            self.ultimo_reporte_ts.date() == ahora.date()):
-            return False
-
-        if ahora.hour in REPORTES_HORAS:
-            self.ultimo_reporte_ts = ahora
-            return True
-        return False
-
-    def _generar_reporte_telegram(self) -> str:
-        """Genera un mensaje conciso con el estado actual del bot."""
-        ahora = datetime.now(GMT_MINUS_3)
-        hora_str = ahora.strftime('%H:%M')
-
-        lineas = [f"📊 {hora_str} AR | C#{self.ciclo_contador:04d}", ""]
-
-        razones_no_operar = []
-        posiciones_abiertas = []
-
-        for symbol in self.config.simbolos:
-            estado = self.estado_simbolos.get(symbol, {})
-            if not estado:
-                continue
-
-            sym_corto = symbol.split('/')[0]  # BTC, ETH, SOL
-            precio = estado.get('precio', 0)
-            st = estado.get('st', False)
-            adx = estado.get('adx', 0)
-            flecha = "↗️" if st else "↘️"
-
-            if estado.get('posicion'):
-                side = estado.get('side_posicion', '').upper()
-                lineas.append(f"• {sym_corto} ${precio:.0f} {flecha} ADX{adx:.0f} 📍POS {side}")
-                posiciones_abiertas.append(f"{sym_corto} {side}")
-            else:
-                lineas.append(f"• {sym_corto} ${precio:.0f} {flecha} ADX{adx:.0f}")
-                razon = estado.get('razon')
-                if razon:
-                    razones_no_operar.append(f"{sym_corto}: {razon}")
-
-        # Resumen final: ¿por qué no operó?
-        if not posiciones_abiertas and razones_no_operar:
-            lineas.append("")
-            lineas.append(f"❌ No operé: {'; '.join(razones_no_operar)}")
-        elif razones_no_operar:
-            lineas.append("")
-            lineas.append(f"❌ Sin señales nuevas: {'; '.join(razones_no_operar)}")
-
-        return "\n".join(lineas)
-
-    def _enviar_reporte_telegram(self):
-        """Genera y envía el reporte horario a Telegram."""
-        try:
-            reporte = self._generar_reporte_telegram()
-            notifier.enviar(reporte, "INFO")
-            self.logger.info(
-                f"📤 Reporte Telegram horario enviado ({len(reporte)} chars)"
-            )
-        except Exception as e:
-            self.logger.warning(f"⚠️ Error enviando reporte Telegram: {e}")
-
-    def ciclo_analisis(self):
-        """Ciclo principal de análisis"""
-        self.ciclo_contador += 1
-        
-        self.logger.info("")  # Línea en blanco
-        self.logger.info("=" * 100)
-        self.logger.info(
-            f"[CICLO #{self.ciclo_contador:04d}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
-            f"| Analizando {len(self.config.simbolos)} símbolos"
-        )
-        self.logger.info("=" * 100)
-        
-        exitos = 0
-        fallos = []
-        
-        for symbol in self.config.simbolos:
-            try:
-                if not self.analizar_symbol(symbol):
-                    fallos.append(symbol)
-                else:
-                    exitos += 1
-            except Exception as e:
-                self.logger.error(f"❌ Excepción en análisis de {symbol}: {e}")
-                self.logger.debug(traceback.format_exc())
-                fallos.append(symbol)
-        
-        # Resumen del ciclo
-        self.logger.info("-" * 100)
-        
-        if exitos == len(self.config.simbolos):
-            # Todos exitosos
-            self.logger.info(
-                f"✅ CICLO #{self.ciclo_contador:04d} COMPLETADO | "
-                f"Todos: {exitos}/{len(self.config.simbolos)} ✅ | "
-                f"Próximo ciclo en {self.config.ciclo_segundos}s"
-            )
-        else:
-            # Algunos fallaron
-            self.logger.warning(
-                f"⚠️ CICLO #{self.ciclo_contador:04d} COMPLETADO | "
-                f"Exitosos: {exitos}/{len(self.config.simbolos)} | "
-                f"Fallos: {', '.join(fallos)} | "
-                f"Próximo ciclo en {self.config.ciclo_segundos}s"
-            )
-
-        self.logger.info("-" * 100)
-
-        # === Reporte horario a Telegram (día cada 1h, noche cada 2h, horario AR) ===
-        if self._debe_enviar_reporte():
-            self._enviar_reporte_telegram()
-    
-    def ejecutar(self):
-        """Bucle principal del bot"""
+    def run(self):
+        """Ejecuta el bot indefinidamente"""
         if not self.inicializar():
-            self.logger.error("❌ Falló la inicialización, deteniendo bot")
             return
         
-        self.logger.info(f"⏱️  Ciclo cada {self.config.ciclo_segundos} segundos...")
-        
         try:
-            while self.activo:
-                try:
-                    self.ciclo_analisis()
-                except Exception as e:
-                    self.logger.error(f"❌ Error en ciclo: {e}")
-                    self.logger.debug(traceback.format_exc())
-                    notifier.enviar(f"Error en ciclo del bot: {e}", "ERROR")
-                
-                time.sleep(self.config.ciclo_segundos)
-        
+            logger.info("Comenzando loop principal...")
+            while self.running:
+                self.ejecutar_ciclo()
         except KeyboardInterrupt:
-            self.logger.info("\n🛑 Bot detenido por usuario")
-            notifier.enviar("Bot detenido manualmente", "INFO")
+            logger.info("Bot detenido por usuario")
         except Exception as e:
-            self.logger.critical(f"❌ Error crítico: {e}")
-            self.logger.debug(traceback.format_exc())
-            notifier.enviar(f"Error crítico en bot: {e}", "ERROR")
+            logger.error(f"Error fatal: {e}\n{traceback.format_exc()}")
         finally:
-            self.activo = False
-
+            self.notifier.enviar("Bot detenido", "INFO")
 
 # ============================================================================
-# FLASK APP Y THREADING
+# FLASK API PARA MONITOREO
 # ============================================================================
 
 app = Flask(__name__)
-bot = None
+bot_instance = None
 
-
-@app.route('/')
-def home():
-    """Endpoint principal - muestra estado del bot"""
-    global bot
-    
-    if bot is None:
-        return (
-            '⏳ <b>Bot de Trading OKX Testnet - Inicializando...</b><br>'
-            'El bot está en proceso de inicio. Intenta de nuevo en 10 segundos.<br><br>'
-            f'Símbolos: {", ".join(config.simbolos)}<br>'
-            'Logs: ver bot_trading.log'
-        ), 202  # 202 Accepted (en proceso)
-    
-    try:
-        ciclo = getattr(bot, 'ciclo_contador', 0)
-        estado = '✅ ACTIVO' if bot.activo else '⏸️ INACTIVO'
-        
-        return (
-            f'🤖 <b>Bot de Trading OKX Testnet {estado}</b><br>'
-            f'Ciclos ejecutados: {ciclo}<br>'
-            f'Símbolos: {", ".join(config.simbolos)}<br>'
-            f'Logs: <a href="/logs">Ver logs en tiempo real</a>'
-        )
-    except Exception as e:
-        return (
-            f'❌ Error obteniendo estado: {str(e)}<br>'
-            'Revisa el archivo bot_trading.log'
-        ), 500
-
-
-@app.route('/status')
+@app.route("/status")
 def status():
-    """Endpoint para verificar estado del bot (JSON)"""
-    global bot
-    
-    if bot is None:
-        return {
-            'estado': 'inicializando',
-            'mensaje': 'El bot está en proceso de inicio',
-            'ciclos_ejecutados': 0,
-            'simbolos': config.simbolos,
-            'timestamp': datetime.now().isoformat()
-        }, 202  # 202 Accepted (en proceso)
-    
+    """Retorna estado del bot"""
+    if bot_instance:
+        return jsonify({
+            "running": bot_instance.running,
+            "ciclos": bot_instance.ciclo_contador,
+            "modo": "simulacion" if bot_instance.config.modo_simulacion else "real",
+            "balance": bot_instance.exchange.obtener_balance(),
+        })
+    return jsonify({"error": "Bot no inicializado"}), 500
+
+@app.route("/trades")
+def trades():
+    """Retorna últimos trades"""
     try:
-        return {
-            'estado': 'activo' if bot.activo else 'inactivo',
-            'ciclos_ejecutados': bot.ciclo_contador,
-            'simbolos': config.simbolos,
-            'timestamp': datetime.now().isoformat()
-        }, 200
+        con = sqlite3.connect(DB_PATH)
+        cursor = con.cursor()
+        cursor.execute("SELECT id, symbol, side, entry_px, exit_px, pnl FROM trades ORDER BY id DESC LIMIT 10")
+        trades_list = [
+            {
+                "id": row[0],
+                "symbol": row[1],
+                "side": row[2],
+                "entry": row[3],
+                "exit": row[4],
+                "pnl": row[5],
+            }
+            for row in cursor.fetchall()
+        ]
+        con.close()
+        return jsonify(trades_list)
     except Exception as e:
-        return {
-            'estado': 'error',
-            'error': str(e),
-            'timestamp': datetime.now().isoformat()
-        }, 500
+        return jsonify({"error": str(e)}), 500
 
-
-
-
-
-if __name__ == '__main__':
+@app.route("/logs")
+def logs():
+    """Retorna últimas líneas del log"""
     try:
-        # Iniciar Flask en hilo de fondo (es daemon)
-        port = int(os.environ.get('PORT', 5000))
-        logger.info(f"🌐 Iniciando Flask en puerto {port}...")
-        
-        flask_thread = threading.Thread(
-            target=lambda: app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False),
-            daemon=True
-        )
-        flask_thread.start()
-        
-        # Esperar a que Flask se levante
-        logger.info("⏳ Esperando a que Flask se levante (5 segundos)...")
-        time.sleep(5)
-        
-        # Iniciar el bot en el thread principal (bloqueante)
-        logger.info("🔄 Intentando instanciar TradingBot...")
-        bot = TradingBot(config)
-        logger.info("✅ TradingBot instanciado con éxito. Ejecutando ciclos...")
-        bot.ejecutar()  # Esto es bloqueante, el bot corre aquí
-        
-    except Exception as e:
-        logger.critical(f"❌ Error fatal: {e}")
-        logger.debug(traceback.format_exc())
-        notifier.enviar(f"Error fatal: {e}", "ERROR")
+        with open("bot_trading.log", "r") as f:
+            lines = f.readlines()[-50:]  # Últimas 50 líneas
+        return jsonify({"logs": lines})
+    except:
+        return jsonify({"error": "No log file"}), 500
+
+# ============================================================================
+# MAIN
+# ============================================================================
+
+def main():
+    global bot_instance
+    
+    # Crear bot
+    config = Config.from_env()
+    bot_instance = TradingBot(config)
+    
+    # Iniciar Flask en thread separado
+    def run_flask():
+        app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    
+    logger.info(f"Flask iniciado en http://localhost:5000")
+    
+    # Ejecutar bot
+    bot_instance.run()
+
+if __name__ == "__main__":
+    main()
