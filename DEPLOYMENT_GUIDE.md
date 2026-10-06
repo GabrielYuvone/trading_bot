@@ -22,7 +22,32 @@ OKX_API_PASSWORD=tu_api_password_aqui
 TELEGRAM_TOKEN=tu_telegram_token_aqui
 TELEGRAM_CHAT_ID=tu_chat_id_aqui
 PORT=5000
+
+# Estrategia y riesgo (v3 — ver ESTRATEGIA.md)
+OKX_SANDBOX=1              # 1 = demo/testnet, 0 = REAL
+SIMBOLOS=BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,XRP/USDT:USDT,DOGE/USDT:USDT
+FRACCION_EQUITY=0.0075     # riesgo por trade (0,5% conservador / 0,75% estándar)
+MAX_POSICIONES=4
+LIMITE_DIARIO_R=3
+PERMITIR_CORTOS=1
+USAR_TP=0                  # 0: sin take-profit (es lo que hace ganar al sistema)
+HEARTBEAT_HORAS=6
+REPORTES_HORAS=9,13,17,21
+LOGS_TOKEN=...             # habilita /logs?token=...
 ```
+
+### Endpoints de diagnóstico (nuevos)
+
+| Ruta | Qué da |
+|---|---|
+| `/status` | Estado + estrategia activa + diagnóstico + salud de la API |
+| `/por_que_no_opero` | Motivos acumulados por los que no se está entrando |
+| `/logs?token=LOGS_TOKEN` | Últimas 250 líneas del log |
+
+Si el bot está vivo pero no opera, entrá a `/por_que_no_opero`: lista cada
+filtro con la cantidad de veces que bloqueó una entrada (ADX bajo, sin giro de
+SuperTrend, sin hueco de portafolio, margen insuficiente, tamaño mínimo, fallos
+de API, etc.).
 
 **⚠️ IMPORTANTE:** 
 - Usa **variables de entorno**, nunca hardcodees las credenciales
@@ -273,6 +298,7 @@ Si el bot falla:
 
 ---
 
-**Última actualización:** Septiembre 2026
-**Versión:** 2.0 Refactorizada
+**Última actualización:** Octubre 2026
+**Versión:** 3.0 (estrategia recalibrada y validada sobre 6 meses de datos)
+**Documento de estrategia:** `ESTRATEGIA.md` · Análisis reproducible: `research/`
 **Estado:** Producción ✅
