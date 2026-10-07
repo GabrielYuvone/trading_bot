@@ -29,11 +29,15 @@ def home():
   return 'Bot de Trading OKX Testnet en ejecución 24/7 🚀'
 
 
-# Configuración de la API de OKX
+# ⚠️ VERSIÓN VIEJA (v1). El bot en producción es bot_trading_refactored.py.
+# Las credenciales que había hardcodeadas acá se eliminaron: ROTOVALAS EN OKX.
+# Este archivo queda sólo como referencia histórica; borrarlo cuando quieras.
+
+# Configuración de la API de OKX (desde variables de entorno)
 exchange = ccxt.okx({
-    'apiKey': '91a74a90-c744-402d-ae04-86f403bb059f',
-    'secret': '923FE090636B096EE97A8A621DD27F61',
-    'password': 'Gab@8350',
+    'apiKey': os.getenv('OKX_API_KEY'),
+    'secret': os.getenv('OKX_API_SECRET'),
+    'password': os.getenv('OKX_API_PASSWORD'),
     'enableRateLimit': True,
     'timeout': 15000,
     'options': {'defaultType': 'swap'},

@@ -1,8 +1,36 @@
 #!/usr/bin/env python3
 """
-Bot de Trading OKX Testnet — v2
+Bot de Trading OKX — v3
 
-Estrategia: SuperTrend(10, 3) + EMA200 + ADX(14), velas de 1h, solo velas cerradas.
+Estrategia: SuperTrend(24, 3.5) + EMA200 + ADX(14) > 20, velas de 1h cerradas.
+
+    LARGO  cuando el SuperTrend gira a alcista, el cierre > EMA200 y ADX > 20
+    CORTO  cuando gira a bajista, el cierre < EMA200 y ADX > 20
+    STOP   banda contraria del SuperTrend en la vela de la señal (~2-3%)
+    SALIDA giro del SuperTrend en contra, o stop. SIN TAKE PROFIT: el
+           beneficio se deja correr (el TP fijo de 2R destruía la
+           expectativa: ver research/).
+
+Validado con 6 meses de velas horarias de 5 perpetuos (research/):
+    ~4,7 señales/semana, 39% de aciertos, expectativa ≈ +0,35R,
+    profit factor 1,8, drawdown máximo ≈ -16%, 33 de 36 combinaciones de
+    parámetros del vecindario rentables (no es un pico sobreajustado).
+
+Cambios de la v3 respecto de la v2 (la que dejó de operar):
+- Parámetros recalibrados (ST 10/3 → 24/3.5, ADX 22 → 20) y TP eliminado.
+- Una señal fallida por un error transitorio YA NO se pierde: se reintenta
+  hasta N ciclos mientras la vela siga vigente (antes se marcaba la vela
+  como procesada ANTES de intentar la entrada: cualquier fallo de red se
+  comía la señal para siempre).
+- Diagnóstico: contador de motivos por símbolo en /status y
+  /por_que_no_opero, más latido por Telegram cada HEARTBEAT_HORAS.
+- Pre-flight al arrancar: avisa si con el capital actual el tamaño por
+  riesgo redondea a cero en algún símbolo (el bot "andaba" pero jamás
+  podía operar).
+- Inicialización con reintentos: un fallo de red al arrancar ya no deja el
+  health-check verde con el bot muerto.
+- Control de portafolio: tope de posiciones simultáneas y por dirección.
+- Órdenes de protección: stop reduceOnly sin TP ('conditional').
 
 Cambios respecto de la versión "opción A" (revisión técnica, expediente 001):
 
@@ -45,6 +73,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 import html
+import json
 import logging
 import os
 import sqlite3
@@ -59,7 +88,18 @@ import pandas as pd
 import requests
 
 GMT_MINUS_3 = timezone(timedelta(hours=-3))
-REPORTES_HORAS = (7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 1, 3, 5)
+# Horas (ARG) en las que se manda el reporte horario. El latido va aparte.
+def _horas_reporte() -> tuple:
+    raw = os.getenv("REPORTES_HORAS")
+    if raw:
+        try:
+            return tuple(int(x) for x in raw.split(",") if x.strip())
+        except ValueError:
+            pass
+    return (9, 13, 17, 21)
+
+
+REPORTES_HORAS = _horas_reporte()
 LOG_FILE = "bot_trading.log"
 DB_FILE = "trades.db"
 
@@ -180,7 +220,7 @@ class BotConfig:
 
     simbolos: List[str] = field(default_factory=lambda: [
         "BTC/USDT:USDT", "ETH/USDT:USDT", "SOL/USDT:USDT",
-        "XRP/USDT:USDT", "AVAX/USDT:USDT",
+        "XRP/USDT:USDT", "DOGE/USDT:USDT",
     ])
     timeframe: str = "1h"
 
@@ -191,27 +231,39 @@ class BotConfig:
     limite_diario_r: float = 3.0          # sin entradas si el día va -3R o peor
     fee_rate: float = 0.0005              # taker OKX aprox. (por lado)
     mmr: float = 0.005                    # margen de mantenimiento aprox.
-    rr_objetivo: float = 2.0
+    rr_objetivo: float = 2.0              # SÓLO si usar_tp=True (no recomendado)
+    usar_tp: bool = False                 # el TP fijo destruye la expectativa
     sl_min_pct: float = 0.002
+    sl_max_pct: float = 0.10              # no entrar si el SL queda demasiado lejos
     margen_seguridad: float = 1.15        # margen requerido * 1.15 <= libre
+    max_posiciones: int = 4               # posiciones simultáneas (5 símbolos)
+    max_pos_misma_dir: int = 3            # tope por dirección (3 = sin tope efectivo)
 
-    # Indicadores
-    st_periodo: int = 10
-    st_multiplier: float = 3.0
+    # Indicadores — SuperTrend(24, 3.5) + EMA200 + ADX(14) > 20 en velas de 1h
+    st_periodo: int = 24
+    st_multiplier: float = 3.5
     periodo_ema: int = 200
     adx_periodo: int = 14
-    adx_threshold: float = 22.0
+    adx_threshold: float = 20.0
+    permitir_cortos: bool = True
 
     # Operación
     ciclo_segundos: int = 60
     limite_velas: int = 1000
-    velas_minimas: int = 300
+    velas_minimas: int = 320
     modo_simulacion: bool = False
     sim_equity_inicial: float = 1000.0
+    sandbox: bool = True              # OKX demo. Pasar a REAL sólo con OKX_SANDBOX=0
+    heartbeat_horas: float = 6.0          # "estoy vivo" por Telegram
+    reintentos_senal: int = 8             # ciclos en que se reintenta una señal fallida
+    deriva_max_entrada: float = 0.015     # si el precio ya corrió >1,5% desde la señal, no perseguir
 
     @classmethod
     def desde_env(cls) -> "BotConfig":
-        return cls(
+        simbolos_env = os.getenv("SIMBOLOS")
+        simbolos = ([s.strip() for s in simbolos_env.split(",") if s.strip()]
+                    if simbolos_env else None)
+        cfg = cls(
             api_key=os.getenv("OKX_API_KEY") or "",
             api_secret=os.getenv("OKX_API_SECRET") or "",
             api_password=os.getenv("OKX_API_PASSWORD") or "",
@@ -225,7 +277,21 @@ class BotConfig:
             fee_rate=_env_float("FEE_RATE", 0.0005),
             modo_simulacion=_env_bool("MODO_SIMULACION", False),
             sim_equity_inicial=_env_float("SIM_EQUITY_INICIAL", 1000.0),
+            sandbox=_env_bool("OKX_SANDBOX", True),
+            usar_tp=_env_bool("USAR_TP", False),
+            rr_objetivo=_env_float("RR_OBJETIVO", 2.0),
+            st_periodo=_env_int("ST_PERIODO", 24),
+            st_multiplier=_env_float("ST_MULTIPLIER", 3.5),
+            adx_threshold=_env_float("ADX_THRESHOLD", 20.0),
+            permitir_cortos=_env_bool("PERMITIR_CORTOS", True),
+            max_posiciones=_env_int("MAX_POSICIONES", 4),
+            max_pos_misma_dir=_env_int("MAX_POS_MISMA_DIR", 3),
+            ciclo_segundos=_env_int("CICLO_SEGUNDOS", 60),
+            heartbeat_horas=_env_float("HEARTBEAT_HORAS", 6.0),
         )
+        if simbolos:
+            cfg.simbolos = simbolos
+        return cfg
 
     def validar(self) -> List[str]:
         errores = []
@@ -235,6 +301,14 @@ class BotConfig:
             errores.append(f"Leverage fuera de rango: {self.leverage}")
         if not (0 < self.fraccion_equity <= 0.02):
             errores.append(f"FRACCION_EQUITY debe estar entre 0 y 0.02: {self.fraccion_equity}")
+        if self.adx_threshold < 0 or self.adx_threshold > 60:
+            errores.append(f"ADX_THRESHOLD fuera de rango: {self.adx_threshold}")
+        if self.st_periodo < 2 or self.st_multiplier <= 0:
+            errores.append(f"Parámetros de SuperTrend inválidos: {self.st_periodo}/{self.st_multiplier}")
+        if self.max_posiciones < 1:
+            errores.append(f"MAX_POSICIONES debe ser >= 1: {self.max_posiciones}")
+        if self.velas_minimas < self.periodo_ema + self.st_periodo * 3:
+            errores.append("VELAS_MINIMAS insuficiente para calcular EMA200 + ADX")
         return errores
 
     @property
@@ -244,7 +318,7 @@ class BotConfig:
 
     @property
     def dist_sl_maxima(self) -> float:
-        return self.dist_liquidacion * 0.8
+        return min(self.dist_liquidacion * 0.8, self.sl_max_pct)
 
 
 # ============================================================================
@@ -279,6 +353,85 @@ class TelegramNotifier:
 
 
 notifier = TelegramNotifier()   # se reemplaza en main()
+
+
+# ============================================================================
+# DIAGNÓSTICO (la respuesta a "¿por qué no está entrando?")
+# ============================================================================
+
+class Diagnostico:
+    """Contadores de cada motivo por el que una señal NO se convirtió en orden.
+
+    Se exponen en /status y en el heartbeat de Telegram. Si el bot deja de
+    operar, esto dice exactamente en qué filtro (o en qué error de API) se
+    está cayendo, sin necesidad de leer logs a ciegas.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.bloqueos: Dict[str, Dict[str, int]] = {}
+        self.globales: Dict[str, int] = {}
+        self.ultimo_error: Optional[str] = None
+        self.ultimo_error_ts: Optional[datetime] = None
+        self.ultima_api_ok: Optional[datetime] = None
+        self.fallos_api_consecutivos: int = 0
+        self.max_fallos_api_consecutivos: int = 0
+        self.inicio: datetime = datetime.now(timezone.utc)
+        self.ultimo_ciclo: Optional[datetime] = None
+        self.ultimo_heartbeat: Optional[datetime] = None
+        self.senales_detectadas: int = 0
+        self.entradas_ejecutadas: int = 0
+        self.entradas_fallidas: int = 0
+
+    def bloqueo(self, symbol: str, motivo: str):
+        with self._lock:
+            self.bloqueos.setdefault(symbol, {})
+            self.bloqueos[symbol][motivo] = self.bloqueos[symbol].get(motivo, 0) + 1
+            self.globales[motivo] = self.globales.get(motivo, 0) + 1
+
+    def api_ok(self):
+        with self._lock:
+            self.ultima_api_ok = datetime.now(timezone.utc)
+            self.fallos_api_consecutivos = 0
+
+    def api_error(self, motivo: str):
+        with self._lock:
+            self.fallos_api_consecutivos += 1
+            self.max_fallos_api_consecutivos = max(self.max_fallos_api_consecutivos,
+                                                   self.fallos_api_consecutivos)
+            self.ultimo_error = str(motivo)[:400]
+            self.ultimo_error_ts = datetime.now(timezone.utc)
+
+    def ciclo(self):
+        with self._lock:
+            self.ultimo_ciclo = datetime.now(timezone.utc)
+
+    def resumen(self) -> Dict:
+        with self._lock:
+            ahora = datetime.now(timezone.utc)
+            return {
+                "desde": self.inicio.isoformat(),
+                "horas_activo": round((ahora - self.inicio).total_seconds() / 3600, 2),
+                "ultimo_ciclo": self.ultimo_ciclo.isoformat() if self.ultimo_ciclo else None,
+                "segundos_desde_ultimo_ciclo": (
+                    (ahora - self.ultimo_ciclo).total_seconds() if self.ultimo_ciclo else None),
+                "ultima_api_ok": self.ultima_api_ok.isoformat() if self.ultima_api_ok else None,
+                "segundos_desde_api_ok": (
+                    (ahora - self.ultima_api_ok).total_seconds() if self.ultima_api_ok else None),
+                "fallos_api_consecutivos": self.fallos_api_consecutivos,
+                "max_fallos_api_consecutivos": self.max_fallos_api_consecutivos,
+                "ultimo_error": self.ultimo_error,
+                "ultimo_error_ts": self.ultimo_error_ts.isoformat() if self.ultimo_error_ts else None,
+                "senales_detectadas": self.senales_detectadas,
+                "entradas_ejecutadas": self.entradas_ejecutadas,
+                "entradas_fallidas": self.entradas_fallidas,
+                "bloqueos_por_simbolo": {k: dict(v) for k, v in self.bloqueos.items()},
+                "bloqueos_totales": dict(sorted(self.globales.items(),
+                                                key=lambda kv: -kv[1])),
+            }
+
+
+diagnostico = Diagnostico()
 
 
 # ============================================================================
@@ -437,7 +590,9 @@ class ExchangeManager:
             "timeout": 15000,
             "options": {"defaultType": "swap"},
         })
-        self.exchange.set_sandbox_mode(True)
+        self.exchange.set_sandbox_mode(cfg.sandbox)
+        self.logger.warning("Modo %s", "DEMO/TESTNET (OKX_SANDBOX=1)" if cfg.sandbox
+                            else "REAL — dinero real (OKX_SANDBOX=0)")
         markets = self.exchange.load_markets()
         self.logger.info("Conexión OKX sandbox OK (%s mercados)", len(markets))
 
@@ -539,6 +694,22 @@ class ExchangeManager:
             raise RuntimeError(f"No se pudo leer la posición de {symbol}")
         return pos
 
+    def posiciones_todas(self) -> Optional[Dict[str, Dict]]:
+        """{symbol: posición} de todas las posiciones abiertas.
+
+        Devuelve None si la consulta falla (nunca se asume 'estoy plano').
+        Una sola llamada por ciclo: menos rate-limit y estado consistente.
+        """
+        try:
+            out: Dict[str, Dict] = {}
+            for p in self.exchange.fetch_positions(None, {"instType": "SWAP"}):
+                if float(p.get("contracts") or 0) > 0:
+                    out[p["symbol"]] = p
+            return out
+        except Exception as e:
+            self.logger.error("No pude leer posiciones: %s", e)
+            return None
+
     def obtener_ticker(self, symbol: str) -> Optional[Dict]:
         try:
             return self.exchange.fetch_ticker(symbol)
@@ -596,32 +767,55 @@ class ExchangeManager:
     def crear_proteccion_oco(self, symbol: str, side_entrada: str, amount: float,
                              sl_precio: float, tp_precio: float) -> Optional[str]:
         """SL + TP en UNA orden OCO reduceOnly. Devuelve algoId o None."""
+        return self._algo_stop(symbol, side_entrada, amount, sl_precio, tp_precio, "oco")
+
+    def crear_proteccion(self, symbol: str, side_entrada: str, amount: float,
+                         sl_precio: float, tp_precio: Optional[float] = None) -> Optional[str]:
+        """Stop de protección reduceOnly.
+
+        Sin TP (recomendado): orden 'conditional' sólo con stop-loss. El
+        beneficio se deja correr hasta que el SuperTrend gire y el bot cierre.
+        Con TP: OCO clásica SL+TP.
+        Si 'conditional' es rechazado, se reintenta como OCO (con TP si hay).
+        """
+        algo = self._algo_stop(symbol, side_entrada, amount, sl_precio, tp_precio, "conditional")
+        if algo or tp_precio is None:
+            return algo
+        self.logger.warning("%s: 'conditional' rechazado, reintento como OCO", symbol)
+        return self._algo_stop(symbol, side_entrada, amount, sl_precio, tp_precio, "oco")
+
+    def _algo_stop(self, symbol: str, side_entrada: str, amount: float,
+                   sl_precio: float, tp_precio: Optional[float], ord_type: str) -> Optional[str]:
         side_cierre = "sell" if side_entrada == "buy" else "buy"
+        body = {
+            "instId": self.exchange.market(symbol)["id"],
+            "tdMode": "isolated",
+            "side": side_cierre,
+            "ordType": ord_type,
+            "sz": self.exchange.amount_to_precision(symbol, amount),
+            "reduceOnly": "true",
+            "slTriggerPx": self.exchange.price_to_precision(symbol, sl_precio),
+            "slOrdPx": "-1",
+            "slTriggerPxType": "last",
+        }
+        if tp_precio is not None:
+            body["tpTriggerPx"] = self.exchange.price_to_precision(symbol, tp_precio)
+            body["tpOrdPx"] = "-1"
+            body["tpTriggerPxType"] = "last"
         try:
-            resp = self.exchange.private_post_trade_order_algo({
-                "instId": self.exchange.market(symbol)["id"],
-                "tdMode": "isolated",
-                "side": side_cierre,
-                "ordType": "oco",
-                "sz": self.exchange.amount_to_precision(symbol, amount),
-                "reduceOnly": "true",
-                "slTriggerPx": self.exchange.price_to_precision(symbol, sl_precio),
-                "slOrdPx": "-1",
-                "slTriggerPxType": "last",
-                "tpTriggerPx": self.exchange.price_to_precision(symbol, tp_precio),
-                "tpOrdPx": "-1",
-                "tpTriggerPxType": "last",
-            })
+            resp = self.exchange.private_post_trade_order_algo(body)
             data = (resp.get("data") or [{}])[0]
             if str(resp.get("code")) == "0" and str(data.get("sCode", "0")) == "0":
                 algo_id = data.get("algoId")
-                self.logger.info("%s: OCO creada SL %.6f / TP %.6f (algoId=%s)",
-                                 symbol, sl_precio, tp_precio, algo_id)
+                self.logger.info("%s: protección %s creada SL %.6f%s (algoId=%s)", symbol,
+                                 ord_type, sl_precio,
+                                 f" / TP {tp_precio:.6f}" if tp_precio else " (sin TP)",
+                                 algo_id)
                 return algo_id or "?"
-            self.logger.error("%s: OCO rechazada code=%s msg=%s sMsg=%s", symbol,
-                              resp.get("code"), resp.get("msg"), data.get("sMsg"))
+            self.logger.error("%s: orden algo '%s' rechazada code=%s msg=%s sMsg=%s", symbol,
+                              ord_type, resp.get("code"), resp.get("msg"), data.get("sMsg"))
         except Exception as e:
-            self.logger.error("%s: error creando OCO: %s", symbol, e)
+            self.logger.error("%s: error creando orden algo '%s': %s", symbol, ord_type, e)
         return None
 
     def algos_pendientes(self, symbol: str) -> List[Dict]:
@@ -807,23 +1001,28 @@ class TechnicalAnalyzer:
             return None
 
     def detectar_senal(self, v: IndicatorValues) -> TrendDirection:
+        """Giro del SuperTrend confirmado con ADX y EMA200 (sólo velas cerradas)."""
         if v.adx <= self.config.adx_threshold:
             return TrendDirection.NEUTRAL
         if not v.st_direction_anterior and v.st_direction and v.precio_cierre > v.ema200:
             return TrendDirection.UPTREND
-        if v.st_direction_anterior and not v.st_direction and v.precio_cierre < v.ema200:
+        if self.config.permitir_cortos and v.st_direction_anterior and \
+                not v.st_direction and v.precio_cierre < v.ema200:
             return TrendDirection.DOWNTREND
         return TrendDirection.NEUTRAL
 
     def razon_no_operar(self, v: IndicatorValues) -> Optional[str]:
+        """Motivo de la ÚLTIMA vela cerrada. Se acumula en el Diagnostico."""
         if v.adx <= self.config.adx_threshold:
-            return f"ADX {v.adx:.1f} <= {self.config.adx_threshold:.0f}"
+            return f"ADX bajo ({v.adx:.1f})"
         if v.st_direction == v.st_direction_anterior:
             return "sin giro de SuperTrend"
         if v.st_direction and v.precio_cierre <= v.ema200:
-            return "giro alcista bajo EMA200"
+            return "giro alcista pero bajo EMA200"
         if not v.st_direction and v.precio_cierre >= v.ema200:
-            return "giro bajista sobre EMA200"
+            return "giro bajista pero sobre EMA200"
+        if not v.st_direction and not self.config.permitir_cortos:
+            return "cortos deshabilitados"
         return None
 
 
@@ -860,36 +1059,39 @@ class TradeExecutor:
         return entrada + rr * (entrada - sl) if side == "buy" else entrada - rr * (sl - entrada)
 
     def dimensionar(self, symbol: str, precio: float, direction: TrendDirection,
-                    v: IndicatorValues) -> Optional[Plan]:
+                    v: IndicatorValues) -> Tuple[Optional[Plan], str]:
+        """Devuelve (plan, motivo). motivo = "" si hay plan; si no, dice por qué.
+
+        Los motivos se registran en el Diagnostico: son la respuesta a
+        "el bot está vivo pero no entra".
+        """
         if direction == TrendDirection.UPTREND:
             side, sl = "buy", v.lower_band
             if sl >= precio:
-                self.logger.warning("%s: banda inferior %.4f >= precio, no sirve de SL", symbol, sl)
-                return None
+                return None, "banda ST no sirve de SL"
             dist = (precio - sl) / precio
         else:
             side, sl = "sell", v.upper_band
             if sl <= precio:
-                self.logger.warning("%s: banda superior %.4f <= precio, no sirve de SL", symbol, sl)
-                return None
+                return None, "banda ST no sirve de SL"
             dist = (sl - precio) / precio
 
         if dist >= self.config.dist_sl_maxima:
             self.logger.warning("%s: SL a %.2f%% vs liquidación ~%.2f%% (%sx) — no opero",
                                 symbol, dist * 100, self.config.dist_liquidacion * 100,
                                 self.config.leverage)
-            return None
+            return None, f"SL demasiado lejos ({dist*100:.1f}%)"
         if dist < self.config.sl_min_pct:
             self.logger.warning("%s: SL demasiado justo (%.2f%%) — no opero", symbol, dist * 100)
-            return None
+            return None, f"SL demasiado justo ({dist*100:.2f}%)"
 
         bal = self._equity()
         if not bal:
-            return None
+            return None, "no pude leer balance (API)"
         equity, libre = bal
         if equity <= 0 or libre <= 0:
             self.logger.error("Equity/libre USDT <= 0")
-            return None
+            return None, "equity o saldo libre <= 0"
 
         riesgo = min(equity * self.config.fraccion_equity, self.config.capital_riesgo_usdt)
         cs = self.exchange.contract_size(symbol)
@@ -898,49 +1100,68 @@ class TradeExecutor:
         amount = self.exchange.cantidad_precisa(symbol, riesgo / perdida_x_contrato)
         minimo = self.exchange.cantidad_minima(symbol)
         if amount <= 0 or amount < minimo:
-            self.logger.warning("%s: tamaño %.6f por debajo del mínimo %.6f", symbol, amount, minimo)
-            return None
+            self.logger.warning("%s: tamaño %.6f por debajo del mínimo %.6f "
+                                "(equity %.2f, riesgo %.2f) — subí FRACCION_EQUITY o el capital",
+                                symbol, amount, minimo, equity, riesgo)
+            return None, f"tamaño mínimo ({amount:.4f} < {minimo:.4f})"
 
         margen = amount * cs * precio / self.config.leverage
         if margen * self.config.margen_seguridad > libre:
             self.logger.warning("%s: margen requerido %.2f > libre %.2f — no opero",
                                 symbol, margen, libre)
-            return None
+            return None, f"margen insuficiente ({margen:.2f} > {libre:.2f})"
 
         riesgo_real = amount * perdida_x_contrato
         self.logger.info("%s: riesgo %.2f USDT (equity %.2f) · SL %.2f%% · %s contratos · margen %.2f",
                          symbol, riesgo_real, equity, dist * 100, amount, margen)
         return Plan(side=side, amount=amount, sl=self.exchange.precio_preciso(symbol, sl),
-                    riesgo_usdt=riesgo_real, dist_sl=dist)
+                    riesgo_usdt=riesgo_real, dist_sl=dist), ""
 
     # --- apertura --------------------------------------------------------
-    def abrir_posicion(self, signal: TradeSignal, v: IndicatorValues) -> bool:
+    def abrir_posicion(self, signal: TradeSignal, v: IndicatorValues) -> Tuple[bool, str, bool]:
+        """Devuelve (ok, motivo, transitorio).
+
+        transitorio=True significa "falló por algo que puede arreglarse solo"
+        (red, sin fill, API). En ese caso el bot NO consume la señal: la
+        reintenta en los próximos ciclos mientras la vela siga vigente.
+        """
         symbol = signal.symbol
         try:
             ticker = self.exchange.obtener_ticker(symbol)
             if not ticker or not ticker.get("last"):
-                return False
+                return False, "sin ticker (API)", True
             precio = float(ticker["last"])
-            plan = self.dimensionar(symbol, precio, signal.direction, v)
+            # No perseguir: si el precio ya se escapó de la señal, abortar.
+            deriva = abs(precio - signal.precio) / signal.precio
+            if deriva > self.config.deriva_max_entrada:
+                self.logger.warning("%s: precio corrido %.2f%% desde la señal — no persigo",
+                                    symbol, deriva * 100)
+                return False, f"precio corrido {deriva*100:.2f}%", False
+
+            plan, motivo = self.dimensionar(symbol, precio, signal.direction, v)
             if not plan:
-                return False
-            razon = f"ST flip {signal.direction.value} ADX {v.adx:.1f}"
+                # "no pude leer balance (API)" es transitorio; el resto es definitivo
+                return False, motivo, motivo.startswith("no pude leer balance")
+            razon = f"ST({self.config.st_periodo},{self.config.st_multiplier}) flip " \
+                    f"{signal.direction.value} ADX {v.adx:.1f}"
             cs = self.exchange.contract_size(symbol)
+            tp = (self.exchange.precio_preciso(symbol, self._tp(plan.side, precio, plan.sl))
+                  if self.config.usar_tp else None)
 
             if self.sim:
-                tp = self.exchange.precio_preciso(symbol, self._tp(plan.side, precio, plan.sl))
                 self.db.abrir(symbol, signal.direction.value, True, v.vela_ts, precio, plan.sl,
-                              tp, plan.amount, cs, plan.riesgo_usdt, razon)
+                              tp or 0.0, plan.amount, cs, plan.riesgo_usdt, razon)
                 msg = (f"SIMULADA {symbol} {signal.direction.value.upper()}\n"
                        f"Tamaño: {plan.amount} · Entrada: {precio:.4f}\n"
-                       f"SL: {plan.sl:.4f} · TP: {tp:.4f} · 1R = {plan.riesgo_usdt:.2f} USDT")
+                       f"SL: {plan.sl:.4f}" + (f" · TP: {tp:.4f}" if tp else " · sin TP (corre el beneficio)") +
+                       f" · 1R = {plan.riesgo_usdt:.2f} USDT")
                 self.logger.info(msg.replace("\n", " | "))
                 notifier.enviar(msg, "TRADE")
-                return True
+                return True, "", False
 
             orden = self.exchange.crear_orden_mercado(symbol, plan.side, plan.amount, reduce_only=False)
             if not orden:
-                return False
+                return False, "la orden de entrada fue rechazada", True
 
             filled, avg = self.exchange.detalle_fill(orden, symbol)
             # Verificar contra la posición real (fuente de verdad)
@@ -948,8 +1169,7 @@ class TradeExecutor:
             contratos = float(pos.get("contracts") or 0) if pos else 0.0
             if contratos <= 0:
                 self.logger.error("%s: entrada sin fill (filled=%s) — no creo protección", symbol, filled)
-                notifier.enviar(f"Entrada sin fill en {symbol}", "ERROR")
-                return False
+                return False, "entrada sin fill", True
             if abs(contratos - plan.amount) > 1e-9:
                 self.logger.warning("%s: fill parcial/distinto: pedido %s, posición %s",
                                     symbol, plan.amount, contratos)
@@ -959,29 +1179,38 @@ class TradeExecutor:
             if dist_real <= 0 or dist_real >= self.config.dist_sl_maxima:
                 self.logger.error("%s: fill %.4f deja SL a %.2f%% — rollback", symbol, fill_px, dist_real * 100)
                 self._rollback(symbol, signal, fill_px, "el fill dejó el SL fuera de rango")
-                return False
+                return False, "fill fuera de rango (rollback)", False
 
-            tp = self.exchange.precio_preciso(symbol, self._tp(plan.side, fill_px, plan.sl))
-            algo_id = self.exchange.crear_proteccion_oco(symbol, plan.side, contratos, plan.sl, tp)
+            # Protección obligatoria: stop en el exchange. Sin TP: el beneficio
+            # se deja correr hasta el giro del SuperTrend (ver README/backtests).
+            algo_id = self.exchange.crear_proteccion(symbol, plan.side, contratos, plan.sl, tp)
             if not algo_id:
-                self._rollback(symbol, signal, fill_px, "no se pudo crear la OCO SL/TP")
-                return False
+                self._rollback(symbol, signal, fill_px, "no se pudo crear el stop de protección")
+                return False, "sin stop de protección (rollback)", True
 
             riesgo_real = contratos * cs * abs(fill_px - plan.sl) + 2 * self.config.fee_rate * fill_px * contratos * cs
-            self.db.abrir(symbol, signal.direction.value, False, v.vela_ts, fill_px, plan.sl, tp,
-                          contratos, cs, riesgo_real, razon)
+            self.db.abrir(symbol, signal.direction.value, False, v.vela_ts, fill_px, plan.sl,
+                          tp or 0.0, contratos, cs, riesgo_real, razon)
             msg = (f"NUEVA OPERACIÓN {symbol} {signal.direction.value.upper()}\n"
                    f"Tamaño: {contratos} contratos · Entrada: {fill_px:.4f}\n"
-                   f"SL: {plan.sl:.4f} · TP: {tp:.4f} (OCO {algo_id})\n"
+                   f"SL: {plan.sl:.4f}" + (f" · TP: {tp:.4f}" if tp else "") +
+                   f" (algo {algo_id})\n"
                    f"1R = {riesgo_real:.2f} USDT · ADX {v.adx:.1f}")
             self.logger.info(msg.replace("\n", " | "))
             notifier.enviar(msg, "TRADE")
-            return True
+            return True, "", False
+        except ccxt.NetworkError as e:
+            self.logger.error("Error de red abriendo posición en %s: %s", symbol, e)
+            return False, f"error de red: {e}", True
+        except ccxt.ExchangeError as e:
+            self.logger.error("Exchange rechazó la entrada en %s: %s", symbol, e)
+            self.logger.debug(traceback.format_exc())
+            return False, f"exchange: {str(e)[:120]}", False
         except Exception as e:
             self.logger.error("Error abriendo posición en %s: %s", symbol, e)
             self.logger.debug(traceback.format_exc())
             notifier.enviar(f"Error abriendo posición en {symbol}: {e}. Revisá OKX.", "ERROR")
-            return False
+            return False, f"excepción: {str(e)[:120]}", True
 
     def _rollback(self, symbol: str, signal: TradeSignal, px: float, motivo: str):
         cerrado = self.exchange.cerrar_todo(symbol)
@@ -1056,10 +1285,13 @@ class TradeExecutor:
             # la vela de entrada (la siguiente a la señal) empezó antes de la entrada real:
             # igual se evalúa completa; es una aproximación conservadora.
             hi, lo = float(vela["high"]), float(vela["low"])
+            tp = float(trade["tp_px"] or 0)
             if trade["side"] == "long":
-                toca_sl, toca_tp = lo <= trade["sl_px"], hi >= trade["tp_px"]
+                toca_sl = lo <= trade["sl_px"]
+                toca_tp = tp > 0 and hi >= tp
             else:
-                toca_sl, toca_tp = hi >= trade["sl_px"], lo <= trade["tp_px"]
+                toca_sl = hi >= trade["sl_px"]
+                toca_tp = tp > 0 and lo <= tp
             if toca_sl:
                 self._cerrar_virtual(trade, trade["sl_px"], "SL (simulado)")
                 return True
@@ -1086,6 +1318,7 @@ class TradingBot:
         self.ciclo_contador = 0
         self.ultimo_reporte_ts: Optional[datetime] = None
         self.simbolos_ok: List[str] = list(cfg.simbolos)
+        self.posiciones: Dict[str, Optional[Dict]] = {}
         self._lock = threading.Lock()
         self._estado: Dict[str, dict] = {}
         self._huerfanas_avisadas: set = set()
@@ -1129,10 +1362,7 @@ class TradingBot:
         if not self.simbolos_ok:
             self.logger.error("Ningún símbolo quedó configurado")
             return False
-        notifier.enviar(f"Bot v2 iniciado ({'SIMULACIÓN' if self.sim else 'TESTNET'}) · "
-                        f"{self.config.leverage}x · {', '.join(s.split('/')[0] for s in self.simbolos_ok)}",
-                        "SUCCESS")
-        return True
+        return True   # el aviso de arranque lo manda notificar_arranque()
 
     def _limite_diario_alcanzado(self) -> bool:
         r_hoy = self.db.resultado_hoy_r(virtual=self.sim)
@@ -1150,9 +1380,9 @@ class TradingBot:
         if posicion is None and trade is not None:
             # OKX ejecutó SL o TP (o se cerró a mano): limpiar y registrar
             self.exchange.cancelar_algos(symbol)
-            res_razon = "SL/TP en exchange"
+            res_razon = "SL en exchange"
             t = self.exchange.obtener_ticker(symbol)
-            if t and t.get("last"):
+            if t and t.get("last") and float(trade["tp_px"] or 0) > 0:
                 last = float(t["last"])
                 res_razon = ("TP en exchange" if abs(last - trade["tp_px"]) < abs(last - trade["sl_px"])
                              else "SL en exchange")
@@ -1168,18 +1398,42 @@ class TradingBot:
             side = "buy" if trade["side"] == "long" else "sell"
             amt = float(posicion.get("contracts") or 0)
             self.logger.error("%s: posición sin OCO — intento recrearla", symbol)
-            if not self.exchange.crear_proteccion_oco(symbol, side, amt, trade["sl_px"], trade["tp_px"]):
+            tp = float(trade["tp_px"] or 0) or None
+            if not self.exchange.crear_proteccion(symbol, side, amt, trade["sl_px"], tp):
                 self.executor.cerrar_por_senal(symbol, "sin protección y OCO rechazada", trade["entry_px"])
 
-    def analizar_symbol(self, symbol: str, entradas_habilitadas: bool) -> bool:
+    # --- señales pendientes (fallo transitorio ≠ señal perdida) ----------
+    def _clave_pendiente(self, symbol: str) -> str:
+        return f"senal_pendiente:{'sim' if self.sim else 'real'}:{symbol}"
+
+    def _leer_pendiente(self, symbol: str) -> Optional[Dict]:
+        raw = self.db.kv_get(self._clave_pendiente(symbol))
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    def _guardar_pendiente(self, symbol: str, datos: Optional[Dict]):
+        clave = self._clave_pendiente(symbol)
+        if datos is None:
+            self.db.kv_set(clave, "")
+        else:
+            self.db.kv_set(clave, json.dumps(datos))
+
+    def analizar_symbol(self, symbol: str, entradas_habilitadas: bool,
+                        posicion: Optional[Dict] = None) -> bool:
         df_raw = self.exchange.obtener_velas_cerradas(symbol)
         if df_raw is None or len(df_raw) < self.config.velas_minimas:
+            diagnostico.bloqueo(symbol, f"datos insuficientes ({0 if df_raw is None else len(df_raw)})")
             self.logger.warning("%s: datos insuficientes (%s/%s)", symbol,
                                 0 if df_raw is None else len(df_raw), self.config.velas_minimas)
             return False
         df = self.analyzer.calcular_indicadores(df_raw)
         v = self.analyzer.extraer_valores(df)
         if not v:
+            diagnostico.bloqueo(symbol, "indicadores no listos")
             return False
 
         dist_ema = (v.precio_cierre - v.ema200) / v.ema200 * 100
@@ -1193,62 +1447,154 @@ class TradingBot:
             trade = self.db.trade_abierto(symbol, virtual=True)
             side_pos = trade["side"] if trade else None
         else:
-            ok, posicion = self.exchange.obtener_posicion_abierta(symbol)
-            if not ok:
-                return False          # sin saber la posición, no se hace nada
             self._conciliar_real(symbol, posicion)
             side_pos = posicion.get("side") if posicion else None
 
         razon = self.analyzer.razon_no_operar(v)
+        if razon:
+            diagnostico.bloqueo(symbol, razon)
         self.set_estado(symbol, {"precio": v.precio_cierre, "st": v.st_direction, "adx": v.adx,
                                  "posicion": side_pos is not None, "side_posicion": side_pos,
-                                 "razon": razon})
+                                 "razon": razon, "ema200": v.ema200})
 
-        # --- salida por giro de SuperTrend ---
+        # --- salida por giro de SuperTrend (con reversión en la misma vela) ---
         if side_pos:
-            if (side_pos == "long" and not v.st_direction) or (side_pos == "short" and v.st_direction):
-                motivo = f"SuperTrend giró {'bajista' if side_pos == 'long' else 'alcista'}"
-                self.logger.warning("SALIDA %s: %s", symbol, motivo)
-                self.executor.cerrar_por_senal(symbol, motivo, v.precio_cierre)
-            return True
+            giro_contra = ((side_pos == "long" and not v.st_direction) or
+                           (side_pos == "short" and v.st_direction))
+            if not giro_contra:
+                return True
+            motivo = f"SuperTrend giró {'bajista' if side_pos == 'long' else 'alcista'}"
+            self.logger.warning("SALIDA %s: %s", symbol, motivo)
+            if self.executor.cerrar_por_senal(symbol, motivo, v.precio_cierre):
+                # Cerrada. Si la vela también da señal en el otro sentido, se
+                # abre YA: un sistema de tendencia revierte cuando gira.
+                (self.posiciones or {}).pop(symbol, None)
+                side_pos = None
+                self.set_estado(symbol, {"precio": v.precio_cierre, "st": v.st_direction,
+                                         "adx": v.adx, "posicion": False, "side_posicion": None,
+                                         "razon": razon, "ema200": v.ema200})
+            else:
+                self.logger.error("%s: no pude cerrar la posición; no abro la contraria", symbol)
+                return True
 
         # --- entrada ---
         senal = self.analyzer.detectar_senal(v)
         if senal == TrendDirection.NEUTRAL:
             return True
+
+        pendiente = self._leer_pendiente(symbol)
+        if pendiente and pendiente.get("vela_ts") != v.vela_ts:
+            # la vela de la señal ya no es la última: el intento caducó
+            self.logger.warning("%s: señal pendiente de la vela %s caducó sin ejecutarse",
+                                symbol, pendiente.get("vela_ts"))
+            notifier.enviar(f"{symbol}: señal {pendiente.get('direccion','?')} NO ejecutada "
+                            f"(se acabaron los reintentos). Motivo: {pendiente.get('motivo','?')}",
+                            "WARNING")
+            self._guardar_pendiente(symbol, None)
+            pendiente = None
+
         if self.ya_procesada(symbol, v.vela_ts):
-            self.logger.debug("%s: señal de la vela %s ya procesada", symbol, v.vela_ts)
-            return True
-        # Se marca ANTES de ejecutar: pase lo que pase, una vela = un intento.
-        self.marcar_procesada(symbol, v.vela_ts)
+            if not pendiente:
+                self.logger.debug("%s: señal de la vela %s ya procesada", symbol, v.vela_ts)
+                return True
+            if pendiente.get("intentos", 0) > self.config.reintentos_senal:
+                self.logger.error("%s: señal agotó los %s reintentos — se descarta",
+                                  symbol, self.config.reintentos_senal)
+                notifier.enviar(f"{symbol}: señal {pendiente.get('direccion','?')} descartada tras "
+                                f"{self.config.reintentos_senal} reintentos. "
+                                f"Último motivo: {pendiente.get('motivo','?')}", "ERROR")
+                self._guardar_pendiente(symbol, None)
+                return True
+
         if not entradas_habilitadas:
+            diagnostico.bloqueo(symbol, "límite diario de pérdidas")
             self.logger.warning("%s: señal %s descartada por límite diario", symbol, senal.value)
             return True
+
+        # --- control de portafolio (huecos y dirección) ---
+        abiertas = [p for s, p in (self.posiciones or {}).items() if p and s != symbol]
+        if len(abiertas) >= self.config.max_posiciones:
+            diagnostico.bloqueo(symbol, f"sin hueco (máx {self.config.max_posiciones} posiciones)")
+            return True
+        dir_objetivo = "long" if senal == TrendDirection.UPTREND else "short"
+        misma_dir = sum(1 for p in abiertas if p.get("side") == dir_objetivo)
+        if misma_dir >= self.config.max_pos_misma_dir:
+            diagnostico.bloqueo(symbol, f"ya hay {misma_dir} posiciones en {dir_objetivo}")
+            return True
+
         signal = TradeSignal(symbol, senal, v.precio_cierre, v.adx, v.vela_ts)
-        self.logger.warning("SEÑAL: %s", signal)
-        self.executor.abrir_posicion(signal, v)
+        diagnostico.senales_detectadas += 1
+        self.logger.warning("SEÑAL: %s%s", signal,
+                            f" (reintento {pendiente['intentos']})" if pendiente else "")
+        ok, motivo, transitorio = self.executor.abrir_posicion(signal, v)
+
+        if ok:
+            diagnostico.entradas_ejecutadas += 1
+            self.marcar_procesada(symbol, v.vela_ts)
+            self._guardar_pendiente(symbol, None)
+            return True
+
+        diagnostico.entradas_fallidas += 1
+        diagnostico.bloqueo(symbol, f"entrada fallida: {motivo}")
+        if transitorio:
+            # NO se consume la señal: se reintenta en el próximo ciclo mientras
+            # la vela siga siendo la última cerrada.
+            self._guardar_pendiente(symbol, {
+                "vela_ts": v.vela_ts, "direccion": senal.value, "motivo": motivo,
+                "intentos": (pendiente or {}).get("intentos", 0) + 1,
+            })
+            self.logger.warning("%s: entrada diferida (%s). Reintento %s de %s.",
+                                symbol, motivo, (pendiente or {}).get("intentos", 0) + 1,
+                                self.config.reintentos_senal)
+        else:
+            self.marcar_procesada(symbol, v.vela_ts)
+            self._guardar_pendiente(symbol, None)
         return True
 
     def ciclo_analisis(self):
         with self._lock:
             self.ciclo_contador += 1
             n = self.ciclo_contador
+        diagnostico.ciclo()
+
+        if self.sim:
+            self.posiciones = {s: {"side": t["side"]} for s in self.simbolos_ok
+                               if (t := self.db.trade_abierto(s, virtual=True))}
+        else:
+            posiciones = self.exchange.posiciones_todas()
+            if posiciones is None:
+                # Sin saber qué hay abierto, no se opera: sería abrir a ciegas.
+                diagnostico.api_error("fetch_positions")
+                self.logger.error("Ciclo #%04d abortado: no pude leer las posiciones. "
+                                  "Fallos consecutivos: %s", n, diagnostico.fallos_api_consecutivos)
+                if diagnostico.fallos_api_consecutivos in (3, 10, 30):
+                    notifier.enviar(f"OKX no responde (fetch_positions) tras "
+                                    f"{diagnostico.fallos_api_consecutivos} intentos: "
+                                    f"{diagnostico.ultimo_error}. El bot sigue vivo pero NO opera "
+                                    f"hasta que la API responda.", "ERROR")
+                return
+            self.posiciones = posiciones
+            diagnostico.api_ok()
+
         entradas = not self._limite_diario_alcanzado()
         fallos = []
         for symbol in self.simbolos_ok:
             try:
-                if not self.analizar_symbol(symbol, entradas):
+                if not self.analizar_symbol(symbol, entradas,
+                                            (self.posiciones or {}).get(symbol)):
                     fallos.append(symbol)
             except Exception as e:
                 self.logger.error("Excepción en %s: %s", symbol, e)
                 self.logger.debug(traceback.format_exc())
                 fallos.append(symbol)
+                diagnostico.bloqueo(symbol, f"excepción: {str(e)[:60]}")
         if fallos:
             self.logger.warning("Ciclo #%04d · fallos: %s", n, ", ".join(fallos))
         else:
             self.logger.info("Ciclo #%04d completo · próximo en %ss", n, self.config.ciclo_segundos)
         if self._debe_enviar_reporte():
             notifier.enviar(self._generar_reporte(), "INFO")
+        self._heartbeat()
 
     def _debe_enviar_reporte(self) -> bool:
         ahora = datetime.now(GMT_MINUS_3)
@@ -1285,7 +1631,42 @@ class TradingBot:
         wr = f"{st['win_rate'] * 100:.0f}%" if st["win_rate"] is not None else "-"
         lineas += ["", f"Hoy: {r_hoy:+.2f}R · Trades: {st['trades']} · WR {wr} · "
                        f"Expectativa {exp} · PnL {st['pnl']:+.2f} USDT"]
+        d = diagnostico.resumen()
+        if d["fallos_api_consecutivos"]:
+            lineas += ["", f"API: {d['fallos_api_consecutivos']} fallos consecutivos · "
+                           f"último: {d['ultimo_error']}"]
+        if d["senales_detectadas"]:
+            lineas += ["", f"Señales: {d['senales_detectadas']} · ejecutadas "
+                           f"{d['entradas_ejecutadas']} · fallidas {d['entradas_fallidas']}"]
         return "\n".join(lineas)
+
+    def _heartbeat(self):
+        """Latido: si el bot está sano pero no opera, hay que enterarse."""
+        ahora = datetime.now(timezone.utc)
+        if diagnostico.ultimo_heartbeat and \
+                (ahora - diagnostico.ultimo_heartbeat).total_seconds() < \
+                self.config.heartbeat_horas * 3600:
+            return
+        diagnostico.ultimo_heartbeat = ahora
+        d = diagnostico.resumen()
+        st = self.db.estadisticas(virtual=self.sim)
+        abiertas = len([p for p in (self.posiciones or {}).values() if p])
+        lineas = [f"LATIDO · {ahora.astimezone(GMT_MINUS_3).strftime('%d/%m %H:%M')} AR",
+                  f"Ciclos: {self.ciclo_contador} · posiciones abiertas: {abiertas}/"
+                  f"{self.config.max_posiciones}",
+                  f"Trades: {st['trades']} · PnL {st['pnl']:+.2f} USDT · "
+                  f"hoy {self.db.resultado_hoy_r(virtual=self.sim):+.2f}R"]
+        if d["segundos_desde_api_ok"] is not None:
+            lineas.append(f"Última API OK hace {d['segundos_desde_api_ok']/60:.0f} min · "
+                          f"fallos consecutivos: {d['fallos_api_consecutivos']}")
+        lineas.append(f"Señales vistas: {d['senales_detectadas']} · ejecutadas: "
+                      f"{d['entradas_ejecutadas']} · fallidas: {d['entradas_fallidas']}")
+        if d["bloqueos_totales"]:
+            top = list(d["bloqueos_totales"].items())[:4]
+            lineas.append("Bloqueos: " + " | ".join(f"{k} ×{v}" for k, v in top))
+        if d["ultimo_error"]:
+            lineas.append(f"Último error: {d['ultimo_error'][:120]}")
+        notifier.enviar("\n".join(lineas), "WARNING" if d["fallos_api_consecutivos"] else "INFO")
 
     def ejecutar(self):
         if not self.inicializar():
@@ -1316,6 +1697,7 @@ app = Flask(__name__)
 _bot_lock = threading.Lock()
 bot: Optional[TradingBot] = None
 config: Optional[BotConfig] = None
+estado_global: Dict[str, object] = {"error_fatal": None, "intentos": 0}
 
 
 def _get_bot() -> Optional[TradingBot]:
@@ -1336,14 +1718,54 @@ def home():
 
 @app.route("/status")
 def status():
+    """Estado operativo completo, incluido el motivo por el que no se entra."""
+    salida = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "diagnostico": diagnostico.resumen(),
+    }
     b = _get_bot()
     if b is None:
-        return {"estado": "inicializando", "timestamp": datetime.now(timezone.utc).isoformat()}, 202
+        salida["estado"] = "inicializando" if not estado_global.get("error_fatal") else "error_fatal"
+        salida["error_fatal"] = estado_global.get("error_fatal")
+        salida["intentos_inicializacion"] = estado_global.get("intentos", 0)
+        return salida, (500 if estado_global.get("error_fatal") else 202)
     s = b.snapshot()
     s["hoy_r"] = b.db.resultado_hoy_r(virtual=b.sim)
     s["estadisticas"] = b.db.estadisticas(virtual=b.sim)
-    s["timestamp"] = datetime.now(timezone.utc).isoformat()
-    return s, 200
+    s["estrategia"] = {
+        "nombre": f"SuperTrend({b.config.st_periodo},{b.config.st_multiplier}) + EMA200 + ADX>{b.config.adx_threshold:.0f}",
+        "timeframe": b.config.timeframe,
+        "riesgo_por_trade": b.config.fraccion_equity,
+        "max_posiciones": b.config.max_posiciones,
+        "take_profit": b.config.usar_tp,
+        "cortos": b.config.permitir_cortos,
+    }
+    salida.update(s)
+    salida["posiciones_abiertas"] = {k: {"side": v.get("side"), "contratos": v.get("contracts")}
+                                     for k, v in (b.posiciones or {}).items() if v}
+    return salida, 200
+
+
+@app.route("/por_que_no_opero")
+def por_que_no_opero():
+    """Resumen legible de los motivos por los que el bot no está entrando."""
+    d = diagnostico.resumen()
+    lineas = [f"Diagnóstico desde {d['desde']} ({d['horas_activo']} h)",
+              f"Ciclo: hace {d['segundos_desde_ultimo_ciclo']} s" if d["segundos_desde_ultimo_ciclo"] is not None else "Sin ciclos aún",
+              f"Última API OK: hace {d['segundos_desde_api_ok']} s" if d["segundos_desde_api_ok"] is not None else "API nunca respondió",
+              f"Fallos API consecutivos: {d['fallos_api_consecutivos']} (máx {d['max_fallos_api_consecutivos']})",
+              f"Señales: {d['senales_detectadas']} · ejecutadas {d['entradas_ejecutadas']} · fallidas {d['entradas_fallidas']}",
+              ""]
+    if d["ultimo_error"]:
+        lineas.append(f"Último error: {d['ultimo_error']}")
+        lineas.append("")
+    lineas.append("Motivos acumulados:")
+    if d["bloqueos_totales"]:
+        for motivo, n in d["bloqueos_totales"].items():
+            lineas.append(f"  ×{n:<5} {motivo}")
+    else:
+        lineas.append("  (ninguno registrado)")
+    return "<pre style='font:13px/1.5 ui-monospace,monospace'>" + html.escape("\n".join(lineas)) + "</pre>"
 
 
 @app.route("/logs")
@@ -1365,6 +1787,62 @@ def logs():
 # MAIN
 # ============================================================================
 
+def preflight(cfg: BotConfig, instancia: "TradingBot") -> str:
+    """Chequeo de arranque: ¿puede el bot operar cada símbolo con este capital?
+
+    El error silencioso más común: con poco capital, el tamaño por riesgo
+    redondea a 0 contratos y el símbolo jamás opera. Acá se ve de entrada.
+    """
+    lineas = []
+    bal = instancia.exchange.balance_usdt() if not cfg.modo_simulacion else None
+    equity = bal[0] if bal else (cfg.sim_equity_inicial +
+                                 instancia.db.pnl_total(virtual=True))
+    riesgo = min(equity * cfg.fraccion_equity, cfg.capital_riesgo_usdt)
+    for symbol in instancia.simbolos_ok:
+        try:
+            df = instancia.exchange.obtener_velas_cerradas(symbol)
+            if df is None:
+                lineas.append(f"- {symbol}: sin datos")
+                continue
+            v = instancia.analyzer.extraer_valores(
+                instancia.analyzer.calcular_indicadores(df))
+            cs = instancia.exchange.contract_size(symbol)
+            minimo = instancia.exchange.cantidad_minima(symbol)
+            px = v.precio_cierre
+            dist = (abs(px - (v.lower_band if v.st_direction else v.upper_band)) / px
+                    if v else 0.02)
+            dist = max(min(dist, cfg.dist_sl_maxima), cfg.sl_min_pct)
+            contratos = riesgo / (dist * px * cs)
+            redondeado = instancia.exchange.cantidad_precisa(symbol, contratos)
+            ok = redondeado >= minimo
+            lineas.append(f"- {symbol.split('/')[0]:<5} px {px:<12.4g} stop típico {dist*100:4.1f}% · "
+                          f"1 contrato ≈ {cs * px:,.0f} USDT · tamaño sugerido {redondeado:g} "
+                          f"(mín {minimo:g}) {'OK' if ok else '⚠️ REDONDEA A CERO'}")
+        except Exception as e:
+            lineas.append(f"- {symbol}: no pude evaluar ({e})")
+    encabezado = (f"Equity {equity:,.2f} USDT · riesgo por trade {riesgo:,.2f} USDT "
+                  f"({cfg.fraccion_equity * 100:.2f}%)")
+    return encabezado + "\n" + "\n".join(lineas)
+
+
+def notificar_arranque(cfg: BotConfig, instancia: "TradingBot"):
+    modo = "SIMULACIÓN" if cfg.modo_simulacion else ("DEMO/TESTNET" if cfg.sandbox else "REAL")
+    msg = (f"Bot iniciado ({modo})\n"
+           f"Estrategia: SuperTrend({cfg.st_periodo},{cfg.st_multiplier}) + EMA{cfg.periodo_ema} "
+           f"+ ADX>{cfg.adx_threshold:.0f} · velas {cfg.timeframe}\n"
+           f"Riesgo {cfg.fraccion_equity * 100:.2f}% · máx {cfg.max_posiciones} posiciones · "
+           f"TP {'sí' if cfg.usar_tp else 'no (se deja correr)'} · "
+           f"cortos {'sí' if cfg.permitir_cortos else 'no'}\n"
+           f"Límite diario {cfg.limite_diario_r:.0f}R\n"
+           f"{', '.join(s.split('/')[0] for s in instancia.simbolos_ok)}")
+    try:
+        msg += "\n" + preflight(cfg, instancia)
+    except Exception as e:
+        logger.warning("Preflight incompleto: %s", e)
+    logger.info("Arranque:\n%s", msg)
+    notifier.enviar(msg, "SUCCESS")
+
+
 def main():
     global bot, config, notifier
     setup_logging(LOG_FILE)
@@ -1383,17 +1861,25 @@ def main():
                      daemon=True).start()
     logger.info("Flask en puerto %s", port)
 
-    try:
-        instancia = TradingBot(config)
-        with _bot_lock:
-            bot = instancia
-        instancia.ejecutar()
-    except Exception as e:
-        logger.critical("Error fatal: %s", e)
-        logger.debug(traceback.format_exc())
-        notifier.enviar(f"Error fatal: {e}", "ERROR")
-        while True:          # mantener vivo el health-check para ver el error
-            time.sleep(60)
+    # Reintentos de inicialización: un fallo de red al arrancar ya no deja al
+    # bot "vivo pero muerto" (el bug que hacía parecer que andaba y no operaba).
+    while True:
+        estado_global["intentos"] = int(estado_global.get("intentos") or 0) + 1
+        try:
+            instancia = TradingBot(config)
+            estado_global["error_fatal"] = None
+            with _bot_lock:
+                bot = instancia
+            notificar_arranque(config, instancia)
+            instancia.ejecutar()          # vuelve sólo si el bucle se detiene
+            logger.error("El bucle principal terminó; reintentando en 60 s")
+        except Exception as e:
+            estado_global["error_fatal"] = f"{type(e).__name__}: {e}"
+            logger.critical("Error fatal (intento %s): %s", estado_global["intentos"], e)
+            logger.debug(traceback.format_exc())
+            notifier.enviar(f"Error fatal al iniciar (intento {estado_global['intentos']}): "
+                            f"{type(e).__name__}: {e}. Reintento en 5 min.", "ERROR")
+        time.sleep(300)
 
 
 if __name__ == "__main__":
